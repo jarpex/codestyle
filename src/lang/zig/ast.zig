@@ -26,9 +26,11 @@ pub const Tree = struct {
         source: [:0]const u8,
         mode: Mode,
     ) interface.CheckError!Tree {
-        const ast = try std.zig.Ast.parse(allocator, source, switch (mode) {
-            .zig => .zig,
-            .zon => .zon,
+        const ast = try std.zig.Ast.parse(allocator, source, .{
+            .mode = switch (mode) {
+                .zig => .zig,
+                .zon => .zon,
+            },
         });
         return .{
             .allocator = allocator,
@@ -231,10 +233,10 @@ pub fn importsStruct(
         .readFileAlloc(io, joined, allocator, .limited(8 * 1024 * 1024)) catch return false;
     defer allocator.free(source);
 
-    const source_z = allocator.dupeZ(u8, source) catch return false;
+    const source_z = allocator.dupeSentinel(u8, source, 0) catch return false;
     defer allocator.free(source_z);
 
-    var tree = std.zig.Ast.parse(allocator, source_z, .zig) catch return false;
+    var tree = std.zig.Ast.parse(allocator, source_z, .{ .mode = .zig }) catch return false;
     defer tree.deinit(allocator);
 
     for (tree.rootDecls()) |decl_idx| {
@@ -389,7 +391,7 @@ test "tree spans map to one-based coordinates" {
     const a = arena.allocator();
 
     const src = "const x: u8 = 1;\n";
-    const tree = try Tree.parse(a, try a.dupeZ(u8, src), .zig);
+    const tree = try Tree.parse(a, try a.dupeSentinel(u8, src, 0), .zig);
     var owned = tree;
     defer owned.deinit();
 
@@ -420,7 +422,7 @@ test "inTestBlock separates test code from runtime code" {
     const a = arena.allocator();
 
     const src = "fn f() void {}\ntest \"t\" {\n    _ = f;\n}\n";
-    const tree = try Tree.parse(a, try a.dupeZ(u8, src), .zig);
+    const tree = try Tree.parse(a, try a.dupeSentinel(u8, src, 0), .zig);
     var owned = tree;
     defer owned.deinit();
 
@@ -446,7 +448,7 @@ test "declaredFnNames collects container-scope functions" {
     const a = arena.allocator();
 
     const src = "fn alpha() void {}\nfn beta() void {}\n";
-    const tree = try Tree.parse(a, try a.dupeZ(u8, src), .zig);
+    const tree = try Tree.parse(a, try a.dupeSentinel(u8, src, 0), .zig);
     var owned = tree;
     defer owned.deinit();
 

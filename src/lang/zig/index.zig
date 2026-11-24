@@ -54,7 +54,7 @@ fn runAstChecks(ctx: *Context, tree: ?*const ts.c.TSTree) CheckError!void {
     if (isManifest(ctx.file_path)) return;
 
     const arena = ctx.allocator;
-    const source_z = arena.dupeZ(u8, ctx.source) catch return error.OutOfMemory;
+    const source_z = arena.dupeSentinel(u8, ctx.source, 0) catch return error.OutOfMemory;
 
     var parsed = ast.Tree.parse(arena, source_z, .zig) catch {
         try reportParseError(ctx, ctx.source);
@@ -116,6 +116,7 @@ fn runAstChecks(ctx: *Context, tree: ?*const ts.c.TSTree) CheckError!void {
     try migration.run(ctx, &parsed);
     try migration.readFileAllocOrder(ctx, &parsed);
     try migration.wave2(ctx, &parsed);
+    try migration.wave017(ctx, &parsed);
 }
 
 fn reportParseError(ctx: *Context, source_text: []const u8) interface.CheckError!void {

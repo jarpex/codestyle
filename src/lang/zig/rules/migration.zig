@@ -124,6 +124,12 @@ pub const migrations = [_]Migration{
         .message = "std.fs.cwd moved to std.Io.Dir.cwd",
         .help = "Use 'std.Io.Dir.cwd()' with an explicit Io parameter",
     },
+    .{
+        .needle = "dupeZ",
+        .rule_id = "zig/removed-dupe-z",
+        .message = "Allocator.dupeZ is removed in 0.17",
+        .help = "Use 'allocator.dupeSentinel(T, slice, 0)'",
+    },
 };
 
 /// `zig/deprecated-gpa`, `zig/legacy-std-io`, the removed-symbol rules and
@@ -384,6 +390,44 @@ fn isFallibleComponentIter(tree: *const Tree, idx: usize) bool {
         if (t == .semicolon or t == .l_brace or t == .r_brace) break;
     }
     return false;
+}
+
+/// Zig 0.17 migration checks: `errdefer |err|`, array `**`, and `b.args`.
+pub fn wave017(ctx: *Context, tree: *const Tree) interface.CheckError!void {
+    var i: usize = 0;
+    while (i < tree.tokens.len) : (i += 1) {
+        const tag = tree.tokens[i].tag;
+        if (tag == .keyword_errdefer and i + 1 < tree.tokens.len and
+            tree.tokens[i + 1].tag == .pipe)
+        {
+            try ctx.report(
+                "zig/removed-errdefer-capture",
+                tree.tokenSpan(i),
+                "errdefer payload capture is removed in 0.17",
+                "Remove '|err|' from 'errdefer'",
+            );
+        } else if (tag == .asterisk and i + 1 < tree.tokens.len and
+            tree.tokens[i + 1].tag == .asterisk)
+        {
+            try ctx.report(
+                "zig/removed-array-mul",
+                tree.tokenSpan(i),
+                "Array multiplication operator '**' is removed in 0.17",
+                "Use '@splat(value)' instead of '**'",
+            );
+        } else if (tag == .identifier and std.mem.eql(u8, tree.tokenText(i), "args") and
+            i >= 2 and tree.tokens[i - 1].tag == .period and
+            tree.tokens[i - 2].tag == .identifier and
+            std.mem.eql(u8, tree.tokenText(i - 2), "b"))
+        {
+            try ctx.report(
+                "zig/removed-build-args",
+                tree.tokenSpan(i),
+                "Build.args is removed in 0.17",
+                "Use 'run_cmd.addPassthruArgs()' in build.zig",
+            );
+        }
+    }
 }
 
 test "migration table has no duplicate needles per rule" {

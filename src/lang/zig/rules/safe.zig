@@ -206,23 +206,36 @@ fn isStdDebugPrint(tree: *const Tree, i: usize) bool {
     return std.mem.eql(u8, tree.tokenText(i + 4), "print");
 }
 
-/// `zig/no-cimport-outside-ffi`: `@cImport` and `@cInclude` are confined to
-/// the FFI boundary.
+/// `zig/no-cimport-outside-ffi`: `@cImport`, `@cInclude`, and `extern "c"`
+/// are confined to the FFI boundary.
 pub fn noCimportOutsideFfi(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     if (ctx.allow.allowsFfi(ctx.file_path)) return;
 
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
-        if (tree.tokens[i].tag != .builtin) continue;
-        const name = tree.tokenText(i);
-        if (!std.mem.eql(u8, name, "@cImport") and !std.mem.eql(u8, name, "@cInclude")) continue;
-
-        try ctx.report(
-            "zig/no-cimport-outside-ffi",
-            tree.tokenSpan(i),
-            "C header imported outside the FFI boundary module",
-            "Import the header in the module that owns the C ABI and re-export the types",
-        );
+        const tag = tree.tokens[i].tag;
+        if (tag == .builtin) {
+            const name = tree.tokenText(i);
+            if (!std.mem.eql(u8, name, "@cImport") and !std.mem.eql(u8, name, "@cInclude")) {
+                continue;
+            }
+            try ctx.report(
+                "zig/no-cimport-outside-ffi",
+                tree.tokenSpan(i),
+                "C header imported outside the FFI boundary module",
+                "Move C ABI bindings into the FFI boundary module and re-export the types",
+            );
+        } else if (tag == .keyword_extern and i + 1 < tree.tokens.len and
+            tree.tokens[i + 1].tag == .string_literal and
+            std.mem.eql(u8, tree.tokenText(i + 1), "\"c\""))
+        {
+            try ctx.report(
+                "zig/no-cimport-outside-ffi",
+                tree.tokenSpan(i),
+                "C ABI extern declaration outside the FFI boundary module",
+                "Move C ABI bindings into the FFI boundary module and re-export the types",
+            );
+        }
     }
 }
 
@@ -597,7 +610,8 @@ test "isStoreTarget accepts an indexed store and rejects a read" {
     defer arena.deinit();
 
     const src = "fn f() void { var b: [4]u8 = undefined; b[0] = 1; }\n";
-    const tree = try Tree.parse(arena.allocator(), try arena.allocator().dupeZ(u8, src), .zig);
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    const tree = try Tree.parse(arena.allocator(), src_z, .zig);
     var owned = tree;
     defer owned.deinit();
 
@@ -621,7 +635,8 @@ test "sum window finds the repeated addend" {
     defer arena.deinit();
 
     const src = "fn f(a: usize, b: usize) bool { return a + b < a; }\n";
-    const tree = try Tree.parse(arena.allocator(), try arena.allocator().dupeZ(u8, src), .zig);
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    const tree = try Tree.parse(arena.allocator(), src_z, .zig);
     var owned = tree;
     defer owned.deinit();
 

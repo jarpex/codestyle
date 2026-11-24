@@ -624,6 +624,30 @@ pub const rules = [_]RuleDef{
         .strict_severity = .warning,
         .description = "tar.extract automatically sanitizes path traversal in 0.16",
     },
+    .{
+        .id = "zig/removed-dupe-z",
+        .default_severity = .note,
+        .strict_severity = .note,
+        .description = "Allocator.dupeZ is removed in 0.17",
+    },
+    .{
+        .id = "zig/removed-errdefer-capture",
+        .default_severity = .note,
+        .strict_severity = .note,
+        .description = "errdefer payload capture is removed in 0.17",
+    },
+    .{
+        .id = "zig/removed-array-mul",
+        .default_severity = .note,
+        .strict_severity = .note,
+        .description = "Array multiplication operator ** is removed in 0.17",
+    },
+    .{
+        .id = "zig/removed-build-args",
+        .default_severity = .note,
+        .strict_severity = .note,
+        .description = "Build.args is removed in 0.17",
+    },
 
     // Zig input fuses (src/lang/zig/source.zig)
     .{

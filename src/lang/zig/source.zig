@@ -125,7 +125,7 @@ fn nulByteFuse(ctx: *Context) interface.CheckError!bool {
 /// Count `{` and `(` nesting with the tokenizer, so strings and comments do
 /// not count. Brackets do not nest the parser and are ignored.
 fn depthFuse(allocator: std.mem.Allocator, ctx: *Context) interface.CheckError!bool {
-    const source_z = try allocator.dupeZ(u8, ctx.source);
+    const source_z = try allocator.dupeSentinel(u8, ctx.source, 0);
     defer allocator.free(source_z);
     const tokens = scan.tokenize(allocator, source_z) catch return true;
     defer allocator.free(tokens);
@@ -173,7 +173,7 @@ test "nul byte aborts the scan" {
     var diags = std.ArrayList(diagnostic.Diagnostic).empty;
     defer diags.deinit(a);
 
-    const src = try a.dupeZ(u8, "const x = 1;\x00const y = 2;\n");
+    const src = try a.dupeSentinel(u8, "const x = 1;\x00const y = 2;\n", 0);
     var ctx = Context{
         .allocator = a,
         .file_path = "test.zig",
@@ -210,7 +210,7 @@ test "nesting deeper than the limit aborts the scan" {
     var ctx = Context{
         .allocator = a,
         .file_path = "test.zig",
-        .source = try a.dupeZ(u8, src.items),
+        .source = try a.dupeSentinel(u8, src.items, 0),
         .diagnostics = &diags,
     };
 
@@ -229,7 +229,7 @@ test "a clean file reaches the suppression map" {
     var diags = std.ArrayList(diagnostic.Diagnostic).empty;
     defer diags.deinit(a);
 
-    const src = try a.dupeZ(u8, "// codestyle:ignore zig/fn-naming\nfn f() void {}\n");
+    const src = try a.dupeSentinel(u8, "// codestyle:ignore zig/fn-naming\nfn f() void {}\n", 0);
     var ctx = Context{
         .allocator = a,
         .file_path = "test.zig",
@@ -253,7 +253,7 @@ test "tab indentation is reported in zig" {
     var diags = std.ArrayList(diagnostic.Diagnostic).empty;
     defer diags.deinit(a);
 
-    const src = try a.dupeZ(u8, "fn f() void {\n\tconst x = 1;\n}\n");
+    const src = try a.dupeSentinel(u8, "fn f() void {\n\tconst x = 1;\n}\n", 0);
     var ctx = Context{
         .allocator = a,
         .file_path = "test.zig",
