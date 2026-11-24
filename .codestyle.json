@@ -1,0 +1,6 @@
+{
+  "unsafe_casts": ["src/core/ts.zig"],
+  "raw_identifiers": ["src/core/ts.zig", "src/lang/c/ast_rules.zig"],
+  "direct_posix": ["src/core/runner.zig"],
+  "fn_naming": []
+}
