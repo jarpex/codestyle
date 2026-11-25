@@ -105,8 +105,8 @@ pub fn allocationCleanup(ctx: *Context, tree: *const Tree) interface.CheckError!
         if (resultIsArgument(tree, i)) continue;
         if (statementIsReturn(tree, i)) continue;
         if (statementStoresInto(tree, i)) continue;
-        if (hasDeferInFunction(tree, i)) continue;
-        if (localIsReturned(tree, i)) continue;
+        if (hasDeferForVar(tree, i)) continue;
+        if (localIsReturnedOrOwned(tree, i)) continue;
 
         try ctx.report(
             "zig/allocation-cleanup",
@@ -201,8 +201,9 @@ fn statementStoresInto(tree: *const Tree, token_index: usize) bool {
     return false;
 }
 
-/// True when the allocation is bound to a local that the function returns.
-fn localIsReturned(tree: *const Tree, callee: usize) bool {
+/// True when the allocation is bound to a local that the function returns or
+/// transfers via `.toOwnedSlice()`.
+fn localIsReturnedOrOwned(tree: *const Tree, callee: usize) bool {
     const start = statementStart(tree, callee);
     if (start >= tree.tokens.len) return false;
     const tag = tree.tokens[start].tag;
@@ -210,7 +211,21 @@ fn localIsReturned(tree: *const Tree, callee: usize) bool {
 
     const name_index = firstIdentifier(tree, start + 1, callee) orelse return false;
     const name = tree.tokenText(name_index);
-    return containsReturnOf(tree, callee, name);
+    return containsReturnOf(tree, callee, name) or containsToOwnedSlice(tree, callee);
+}
+
+fn containsToOwnedSlice(tree: *const Tree, offset: usize) bool {
+    const fn_decl = ast.fnAtOffset(tree, tree.tokens[offset].start) orelse return false;
+    const bounds = ast.fnBytes(tree, fn_decl);
+    var i: usize = 0;
+    while (i < tree.tokens.len) : (i += 1) {
+        const t = tree.tokens[i];
+        if (t.start < bounds.start or t.end > bounds.end) continue;
+        if (t.tag == .identifier and std.mem.eql(u8, tree.tokenText(i), "toOwnedSlice")) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn firstIdentifier(tree: *const Tree, from: usize, to: usize) ?usize {
@@ -236,16 +251,45 @@ fn containsReturnOf(tree: *const Tree, offset: usize, name: []const u8) bool {
     return false;
 }
 
-fn hasDeferInFunction(tree: *const Tree, token_index: usize) bool {
+fn boundLocalName(tree: *const Tree, callee: usize) ?[]const u8 {
+    const start = statementStart(tree, callee);
+    if (start >= tree.tokens.len) return null;
+    const tag = tree.tokens[start].tag;
+    if (tag != .keyword_const and tag != .keyword_var) return null;
+    const name_index = firstIdentifier(tree, start + 1, callee) orelse return null;
+    return tree.tokenText(name_index);
+}
+
+fn hasDeferForVar(tree: *const Tree, token_index: usize) bool {
     const fn_decl = ast.fnAtOffset(tree, tree.tokens[token_index].start) orelse return false;
     const bounds = ast.fnBytes(tree, fn_decl);
+    const local_name = boundLocalName(tree, token_index);
 
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
         const t = tree.tokens[i];
         if (t.start < bounds.start or t.end > bounds.end) continue;
         if (t.tag != .keyword_defer and t.tag != .keyword_errdefer) continue;
-        return true;
+        const target = local_name orelse return true;
+        if (deferMentionsIdent(tree, i + 1, bounds.end, target)) return true;
+    }
+    return false;
+}
+
+fn deferMentionsIdent(tree: *const Tree, from: usize, fn_end: usize, name: []const u8) bool {
+    var depth: usize = 0;
+    var j = from;
+    while (j < tree.tokens.len) : (j += 1) {
+        const t = tree.tokens[j];
+        if (t.end > fn_end) break;
+        if (t.tag == .l_brace) depth += 1;
+        if (t.tag == .r_brace) {
+            if (depth == 0) break;
+            depth -= 1;
+            if (depth == 0) break;
+        }
+        if (t.tag == .semicolon and depth == 0) break;
+        if (t.tag == .identifier and std.mem.eql(u8, tree.tokenText(j), name)) return true;
     }
     return false;
 }
@@ -253,10 +297,6 @@ fn hasDeferInFunction(tree: *const Tree, token_index: usize) bool {
 /// `zig/no-recursion`: a function that calls itself. Heuristic: off by
 /// default because mutual recursion needs call-graph analysis.
 pub fn noRecursion(ctx: *Context, tree: *const Tree) interface.CheckError!void {
-    var names: std.StringHashMap(void) = .init(ctx.allocator);
-    defer names.deinit();
-    ast.declaredFnNames(tree, &names) catch return;
-
     var i: usize = 0;
     while (i < tree.nodeCount()) : (i += 1) {
         if (tree.tag(i) != .fn_decl) continue;
@@ -303,4 +343,39 @@ test "read names are all lowercase" {
     for (reads) |name| {
         try std.testing.expect(name.len > 4);
     }
+}
+
+test "allocationCleanup matches deferred variable and allows toOwnedSlice" {
+    const src: [:0]const u8 =
+        \\fn leak(a: std.mem.Allocator, file: anytype) !void {
+        \\    defer file.close();
+        \\    const buf = try a.alloc(u8, 4);
+        \\    _ = buf;
+        \\}
+        \\fn ok(a: std.mem.Allocator) ![]u8 {
+        \\    const buf = try a.alloc(u8, 4);
+        \\    defer a.free(buf);
+        \\    const owned = try a.alloc(u8, 8);
+        \\    _ = owned;
+        \\    return toOwnedSlice();
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    var tree = try Tree.parse(arena.allocator(), src_z, .zig);
+    defer tree.deinit();
+
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "test.zig",
+        .source = src,
+        .diagnostics = &diags,
+        .profile = .strict,
+    };
+    try allocationCleanup(&ctx, &tree);
+
+    try std.testing.expectEqual(@as(usize, 1), diags.items.len);
+    try std.testing.expectEqual(@as(usize, 3), diags.items[0].span.start_line);
 }

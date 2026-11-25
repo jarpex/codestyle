@@ -223,6 +223,18 @@ test "invalid Zig fixture reports safety, complexity, and migration rules" {
     try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/no-anyerror") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/block-depth") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/no-catch-unreachable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/deprecated-gpa") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/stream-too-long") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/deprecated-gpa") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "zig/stream-too-long") == null);
+
+    var mig_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer mig_arena.deinit();
+    const mig_res = try runCapture(
+        mig_arena.allocator(),
+        "tests/fixtures/zig/invalid.zig",
+        .clippy,
+        .migration,
+    );
+    try std.testing.expectEqual(@as(u8, 1), mig_res.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, mig_res.text, "zig/deprecated-gpa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mig_res.text, "zig/stream-too-long") != null);
 }

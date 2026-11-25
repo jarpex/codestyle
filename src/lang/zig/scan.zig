@@ -23,6 +23,25 @@ pub fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) interface.Ch
     return tokens.toOwnedSlice(allocator);
 }
 
+/// Build `Token` slices directly from `std.zig.Ast.tokens` without re-lexing.
+pub fn tokensFromAst(
+    allocator: std.mem.Allocator,
+    ast: *const std.zig.Ast,
+) interface.CheckError![]Token {
+    const tags = ast.tokens.items(.tag);
+    const starts = ast.tokens.items(.start);
+    var tokens: std.ArrayList(Token) = .empty;
+    errdefer tokens.deinit(allocator);
+    try tokens.ensureTotalCapacity(allocator, tags.len);
+
+    for (tags, starts, 0..) |tag, start, i| {
+        if (tag == .eof) break;
+        const len = ast.tokenSlice(@intCast(i)).len;
+        tokens.appendAssumeCapacity(.{ .tag = tag, .start = start, .end = start + len });
+    }
+    return tokens.toOwnedSlice(allocator);
+}
+
 /// Byte offset to 1-based line and column. Columns count bytes, which matches
 /// the span columns the reporters print.
 pub const LineIndex = struct {

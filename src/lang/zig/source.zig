@@ -49,7 +49,8 @@ pub fn runPass(allocator: std.mem.Allocator, ctx: *Context) interface.CheckError
 
     // The map lives in the per-file arena so the AST pass can read it; a
     // stack local would dangle once this function returns.
-    const stored = try allocator.create(suppression.Map);
+    const arena = allocator;
+    const stored = try arena.create(suppression.Map);
     stored.* = try suppression.parse(allocator, ctx.source, .{}, &result.rejected);
     ctx.suppressions = stored;
 

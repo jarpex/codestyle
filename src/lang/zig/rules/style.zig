@@ -46,8 +46,8 @@ pub fn isSnakeCase(name: []const u8) bool {
 
 /// File stem without the extension, so `ast.zig` yields `ast`.
 pub fn fileStem(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    const ext = std.fs.path.extension(base);
+    const base = std.Io.Dir.path.basename(path);
+    const ext = std.Io.Dir.path.extension(base);
     return base[0 .. base.len - ext.len];
 }
 
@@ -102,11 +102,12 @@ pub fn fileNaming(ctx: *Context, tree: *const Tree) interface.CheckError!void {
 pub fn typeNaming(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
-        if (!startsTypeBody(tree.tokens[i].tag)) continue;
-        if (i == 0 or tree.tokens[i - 1].tag != .equal) continue;
-        if (i < 2 or tree.tokens[i - 2].tag != .identifier) continue;
+        if (!startsTypeBody(tree, i)) continue;
 
-        const name_token = i - 2;
+        const eq_idx = typeEqualIndex(tree, i) orelse continue;
+        if (eq_idx == 0 or tree.tokens[eq_idx - 1].tag != .identifier) continue;
+
+        const name_token = eq_idx - 1;
         if (isTitleCase(tree.tokenText(name_token))) continue;
 
         try reportName(
@@ -120,11 +121,50 @@ pub fn typeNaming(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     }
 }
 
-fn startsTypeBody(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .keyword_struct, .keyword_enum, .keyword_union, .keyword_opaque, .keyword_error => true,
+fn typeEqualIndex(tree: *const Tree, type_tok: usize) ?usize {
+    if (type_tok == 0) return null;
+    if (tree.tokens[type_tok - 1].tag == .equal) return type_tok - 1;
+    const tag = tree.tokens[type_tok].tag;
+    const allows_mod = tag == .keyword_struct or tag == .keyword_enum or tag == .keyword_union;
+    if (!allows_mod or type_tok < 2) return null;
+    const mod = tree.tokens[type_tok - 1].tag;
+    if (mod != .keyword_extern and mod != .keyword_packed) return null;
+    return if (tree.tokens[type_tok - 2].tag == .equal) type_tok - 2 else null;
+}
+
+fn startsTypeBody(tree: *const Tree, i: usize) bool {
+    return switch (tree.tokens[i].tag) {
+        .keyword_struct, .keyword_enum, .keyword_union, .keyword_opaque => true,
+        .keyword_error => i + 1 < tree.tokens.len and tree.tokens[i + 1].tag == .l_brace,
         else => false,
     };
+}
+
+test "typeNaming ignores error values and catches extern/packed structs and error sets" {
+    const src: [:0]const u8 =
+        \\const my_err = error.OutOfMemory;
+        \\const bad_err = error{Foo};
+        \\const bad_packed = packed struct { x: u8 };
+        \\const GoodExtern = extern struct { x: u32 };
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    var tree = try Tree.parse(arena.allocator(), src_z, .zig);
+    defer tree.deinit();
+
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "test.zig",
+        .source = src,
+        .diagnostics = &diags,
+    };
+    try typeNaming(&ctx, &tree);
+
+    try std.testing.expectEqual(@as(usize, 2), diags.items.len);
+    try std.testing.expectEqual(@as(usize, 2), diags.items[0].span.start_line);
+    try std.testing.expectEqual(@as(usize, 3), diags.items[1].span.start_line);
 }
 
 fn findToken(tree: *const Tree, start: usize, end: usize, tag: std.zig.Token.Tag) ?usize {
@@ -177,60 +217,69 @@ pub fn varNaming(ctx: *Context, tree: *const Tree) interface.CheckError!void {
             else => false,
         };
         if (is_decl) {
-            // Container-scope constants name types and namespaces, which the
-            // type and import rules own. Only function-local declarations are
-            // checked here.
-            if (ast.fnAtOffset(tree, tree.nodeBytes(i).start) == null) continue;
-            if (tree.ast.fullVarDecl(tree.nodeAt(i))) |decl| {
-                const name_token = decl.ast.mut_token + 1;
-                const name = tree.ast.tokenSlice(name_token);
-                if (name.len > 0 and !isSnakeCase(name)) {
-                    try reportName(
-                        ctx,
-                        "zig/var-naming",
-                        tree,
-                        @intCast(name_token),
-                        "Variable or parameter name does not use snake_case",
-                        "Name variables using snake_case (e.g. buffer_size, item_count)",
-                    );
-                }
-            }
+            try checkLocalVarDecl(ctx, tree, i);
             continue;
         }
 
         if (tag == .container_field_init or tag == .container_field_align or
             tag == .container_field)
         {
-            // Enum tags are the enum-tag-naming rule's business.
-            if (ast.isInsideEnum(tree, i)) continue;
-            const field = tree.ast.fullContainerField(tree.nodeAt(i)) orelse continue;
-            if (ast.fieldIsExternalSchema(tree, i)) continue;
-            const name_token = field.ast.main_token;
-            const name = tree.ast.tokenSlice(name_token);
-            if (name.len > 0 and !isSnakeCase(name)) {
-                try reportName(
-                    ctx,
-                    "zig/var-naming",
-                    tree,
-                    @intCast(name_token),
-                    "Variable or parameter name does not use snake_case",
-                    "Name fields using snake_case (e.g. buffer_size, item_count)",
-                );
-            }
+            try checkContainerField(ctx, tree, i);
             continue;
         }
 
         if (tag == .fn_decl) {
-            var params: std.ArrayList([]const u8) = .empty;
-            defer params.deinit(ctx.allocator);
-            try ast.paramNames(tree, i, &params);
-            for (params.items) |name| {
-                if (!isSnakeCase(name)) {
-                    // Parameter tokens are re-found by scanning the signature.
-                    try reportParamName(ctx, tree, i, name);
-                }
-            }
+            try checkFnParams(ctx, tree, i);
         }
+    }
+}
+
+fn checkLocalVarDecl(ctx: *Context, tree: *const Tree, i: usize) interface.CheckError!void {
+    // Container-scope constants name types and namespaces, which the type and
+    // import rules own. Only function-local declarations are checked here.
+    if (ast.fnAtOffset(tree, tree.nodeBytes(i).start) == null) return;
+    const decl = tree.ast.fullVarDecl(tree.nodeAt(i)) orelse return;
+    const name_token = decl.ast.mut_token + 1;
+    const name = tree.ast.tokenSlice(name_token);
+    if (name.len == 0 or isSnakeCase(name)) return;
+
+    try reportName(
+        ctx,
+        "zig/var-naming",
+        tree,
+        @intCast(name_token),
+        "Variable or parameter name does not use snake_case",
+        "Name variables using snake_case (e.g. buffer_size, item_count)",
+    );
+}
+
+fn checkContainerField(ctx: *Context, tree: *const Tree, i: usize) interface.CheckError!void {
+    // Enum tags are the enum-tag-naming rule's business.
+    if (ast.isInsideEnum(tree, i)) return;
+    const field = tree.ast.fullContainerField(tree.nodeAt(i)) orelse return;
+    if (ast.fieldIsExternalSchema(tree, i)) return;
+    const name_token = field.ast.main_token;
+    const name = tree.ast.tokenSlice(name_token);
+    if (name.len == 0 or isSnakeCase(name)) return;
+
+    try reportName(
+        ctx,
+        "zig/var-naming",
+        tree,
+        @intCast(name_token),
+        "Variable or parameter name does not use snake_case",
+        "Name fields using snake_case (e.g. buffer_size, item_count)",
+    );
+}
+
+fn checkFnParams(ctx: *Context, tree: *const Tree, i: usize) interface.CheckError!void {
+    var params: std.ArrayList([]const u8) = .empty;
+    defer params.deinit(ctx.allocator);
+    try ast.paramNames(tree, i, &params);
+    for (params.items) |name| {
+        if (isSnakeCase(name)) continue;
+        // Parameter tokens are re-found by scanning the signature.
+        try reportParamName(ctx, tree, i, name);
     }
 }
 
@@ -431,7 +480,7 @@ pub fn noRawIdentifiers(ctx: *Context, tree: *const Tree) interface.CheckError!v
         if (isKeyword(text[2 .. text.len - 1])) continue;
         // A field named by an external schema is not ours to rename; the
         // container signals that with its own jsonStringify.
-        if (ast.fieldIsExternalSchema(tree, i)) continue;
+        if (ast.fieldIsExternalSchemaAt(tree, tree.tokens[i].start)) continue;
         try ctx.report(
             "zig/no-raw-identifiers",
             tree.tokenSpan(i),
@@ -530,4 +579,31 @@ test "fileStem drops the extension" {
 test "hasUpper finds any uppercase letter" {
     try std.testing.expect(hasUpper("myFile"));
     try std.testing.expect(!hasUpper("my_file"));
+}
+
+test "noRawIdentifiers handles raw identifier past 50 tokens without panic" {
+    const src: [:0]const u8 =
+        \\const a1 = 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10;
+        \\const a2 = 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10;
+        \\const a3 = 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10;
+        \\const @"foo" = 42;
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    var tree = try Tree.parse(arena.allocator(), src_z, .zig);
+    defer tree.deinit();
+    try std.testing.expect(tree.tokens.len > 50);
+
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "test.zig",
+        .source = src,
+        .diagnostics = &diags,
+    };
+    try noRawIdentifiers(&ctx, &tree);
+
+    try std.testing.expectEqual(@as(usize, 1), diags.items.len);
+    try std.testing.expectEqual(@as(usize, 4), diags.items[0].span.start_line);
 }

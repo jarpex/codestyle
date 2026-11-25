@@ -62,6 +62,7 @@ fn runAstChecks(ctx: *Context, tree: ?*const ts.c.TSTree) CheckError!void {
     };
     defer parsed.deinit();
 
+    try migration.wave017(ctx, &parsed);
     if (parsed.ast.errors.len > 0) {
         try reportParseErrors(ctx, &parsed);
         return;
@@ -116,7 +117,6 @@ fn runAstChecks(ctx: *Context, tree: ?*const ts.c.TSTree) CheckError!void {
     try migration.run(ctx, &parsed);
     try migration.readFileAllocOrder(ctx, &parsed);
     try migration.wave2(ctx, &parsed);
-    try migration.wave017(ctx, &parsed);
 }
 
 fn reportParseError(ctx: *Context, source_text: []const u8) interface.CheckError!void {

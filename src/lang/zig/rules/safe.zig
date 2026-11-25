@@ -15,10 +15,10 @@ const unsafe_casts = [_][]const u8{
     "@volatileCast",
 };
 
-const debug_builtins = [_][]const u8{ "@compileLog", "@compileError" };
+const debug_builtins = [_][]const u8{"@compileLog"};
 
-/// `zig/no-catch-unreachable`: `catch unreachable`, `orelse unreachable` and
-/// `catch |_| unreachable` are forbidden outside `comptime` and tests.
+/// `zig/no-catch-unreachable`: `catch unreachable`, `orelse unreachable`,
+/// `catch undefined`, and `orelse undefined` are forbidden outside `comptime` and tests.
 pub fn noCatchUnreachable(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
@@ -33,13 +33,19 @@ pub fn noCatchUnreachable(ctx: *Context, tree: *const Tree) interface.CheckError
             while (j < tree.tokens.len and tree.tokens[j].tag != .pipe) : (j += 1) {}
             if (j < tree.tokens.len) j += 1;
         }
-        if (j >= tree.tokens.len or tree.tokens[j].tag != .keyword_unreachable) continue;
-        if (ast.inTestBlockToken(tree, i)) continue;
+        if (j >= tree.tokens.len) continue;
+        const rhs = tree.tokens[j].tag;
+        const is_undef = rhs == .identifier and std.mem.eql(u8, tree.tokenText(j), "undefined");
+        if (rhs != .keyword_unreachable and !is_undef) continue;
+        if (ast.inTestBlockToken(tree, i) or ast.inComptimeBlockToken(tree, i)) continue;
 
         try ctx.report(
             "zig/no-catch-unreachable",
             tree.tokenSpan(i),
-            "Error path marked unreachable instead of handled",
+            if (is_undef)
+                "Error path yields undefined instead of being handled"
+            else
+                "Error path marked unreachable instead of handled",
             "Handle the error, or propagate it to the caller with 'try'",
         );
     }
@@ -61,6 +67,7 @@ pub fn noSwallowedErrors(ctx: *Context, tree: *const Tree) interface.CheckError!
         if (j + 1 >= tree.tokens.len) continue;
         if (tree.tokens[j].tag != .l_brace or tree.tokens[j + 1].tag != .r_brace) continue;
         if (ast.inTestBlockToken(tree, i)) continue;
+        if (isCancelCallBefore(tree, i)) continue;
 
         try ctx.report(
             "zig/no-swallowed-errors",
@@ -69,6 +76,23 @@ pub fn noSwallowedErrors(ctx: *Context, tree: *const Tree) interface.CheckError!
             "Handle the error, log it, or propagate it with 'try'",
         );
     }
+}
+
+fn isCancelCallBefore(tree: *const Tree, catch_idx: usize) bool {
+    if (catch_idx < 3 or tree.tokens[catch_idx - 1].tag != .r_paren) return false;
+    var j = catch_idx - 1;
+    var depth: usize = 0;
+    while (j > 0) : (j -= 1) {
+        if (tree.tokens[j].tag == .r_paren) depth += 1;
+        if (tree.tokens[j].tag == .l_paren) {
+            depth -= 1;
+            if (depth == 0) {
+                return j > 0 and tree.tokens[j - 1].tag == .identifier and
+                    std.mem.eql(u8, tree.tokenText(j - 1), "cancel");
+            }
+        }
+    }
+    return false;
 }
 
 /// `zig/no-runtime-safety-off`: `@setRuntimeSafety(false)` is forbidden.
@@ -104,10 +128,11 @@ pub fn noPanicUnreachable(ctx: *Context, tree: *const Tree) interface.CheckError
             const prev = tree.tokens[i - 1].tag;
             if (prev == .keyword_catch or prev == .keyword_orelse or prev == .pipe) continue;
         }
-        if (ast.inTestBlockToken(tree, i)) continue;
+        if (ast.inTestBlockToken(tree, i) or ast.inComptimeBlockToken(tree, i)) continue;
+        if (is_panic and isInMainFn(tree, tree.tokens[i].start)) continue;
 
         try ctx.report(
-            "zig/no-panic-unreachable",
+            if (is_panic) "zig/no-panic-in-lib" else "zig/no-bare-unreachable",
             tree.tokenSpan(i),
             if (is_panic)
                 "Call to @panic() aborts the process"
@@ -164,18 +189,20 @@ pub fn noDebugInLib(ctx: *Context, tree: *const Tree) interface.CheckError!void 
 
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
-        if (tree.tokens[i].tag == .builtin) {
-            const name = tree.tokenText(i);
-            for (debug_builtins) |builtin| {
-                if (std.mem.eql(u8, name, builtin)) {
-                    try reportDebug(ctx, tree, i, "Compile-time log left in library code");
-                }
-            }
+        if (tree.tokens[i].tag == .builtin and isDebugBuiltin(tree.tokenText(i))) {
+            try reportDebug(ctx, tree, i, "Compile-time log left in library code");
         }
         if (isStdDebugPrint(tree, i)) {
             try reportDebug(ctx, tree, i, "Debug print left in library code");
         }
     }
+}
+
+fn isDebugBuiltin(name: []const u8) bool {
+    for (debug_builtins) |builtin| {
+        if (std.mem.eql(u8, name, builtin)) return true;
+    }
+    return false;
 }
 
 fn reportDebug(
@@ -265,22 +292,43 @@ pub fn noGlobalVar(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     }
 }
 
-/// `zig/no-exit-in-lib`: `std.process.exit` belongs to `main`.
+/// `zig/no-exit-in-lib`: `std.process.exit` is only allowed in `main` with no active `defer`.
 pub fn noExitInLib(ctx: *Context, tree: *const Tree) interface.CheckError!void {
-    if (ast.declaresMain(tree)) return;
-
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
         if (!isStdProcessExit(tree, i)) continue;
         if (ast.inTestBlockToken(tree, i)) continue;
 
+        const off = tree.tokens[i].start;
+        if (isInMainFn(tree, off)) {
+            const fn_decl = ast.fnAtOffset(tree, off).?;
+            if (!hasDeferBefore(tree, fn_decl, off)) continue;
+        }
+
         try ctx.report(
             "zig/no-exit-in-lib",
             tree.tokenSpan(i),
-            "Process exit called from library code",
+            "Process exit called from library code or with active defer",
             "Return an error and let main decide the exit code",
         );
     }
+}
+
+fn isInMainFn(tree: *const Tree, offset: usize) bool {
+    const fn_decl = ast.fnAtOffset(tree, offset) orelse return false;
+    const name = ast.fnName(tree, fn_decl) orelse return false;
+    return std.mem.eql(u8, name, "main");
+}
+
+fn hasDeferBefore(tree: *const Tree, fn_decl: usize, offset: usize) bool {
+    const bounds = ast.fnBytes(tree, fn_decl);
+    var i: usize = 0;
+    while (i < tree.tokens.len) : (i += 1) {
+        const t = tree.tokens[i];
+        if (t.start < bounds.start or t.start >= offset) continue;
+        if (t.tag == .keyword_defer or t.tag == .keyword_errdefer) return true;
+    }
+    return false;
 }
 
 fn isStdProcessExit(tree: *const Tree, i: usize) bool {
@@ -337,115 +385,120 @@ test "unsafe cast names are all builtin calls" {
     }
 }
 
-test "debug builtin list covers both log forms" {
-    try std.testing.expectEqual(@as(usize, 2), debug_builtins.len);
+test "debug builtin list covers compileLog" {
+    try std.testing.expectEqual(@as(usize, 1), debug_builtins.len);
 }
 
 /// `zig/no-post-overflow-check`: `a + b < a` is undefined behaviour in
 /// ReleaseFast because the addition already wrapped.
 pub fn noPostOverflowCheck(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     var i: usize = 0;
-    while (i < tree.tokens.len) : (i += 1) {
-        if (!isComparisonOp(tree.tokens[i].tag)) continue;
-        if (!addendRepeats(tree, i)) continue;
+    while (i < tree.nodeCount()) : (i += 1) {
+        if (!isComparisonNode(tree.tag(i))) continue;
+        const lhs, const rhs = tree.ast.nodeData(tree.nodeAt(i)).node_and_node;
+        if (!sumsInto(tree, lhs, rhs) and !sumsInto(tree, rhs, lhs)) continue;
 
         try ctx.report(
             "zig/no-post-overflow-check",
-            tree.tokenSpan(i),
+            tree.nodeSpan(i),
             "Post-addition overflow check after the wrap",
             "Use 'std.math.add' or '@addWithOverflow' before comparing",
         );
     }
 }
 
-fn isComparisonOp(tag: std.zig.Token.Tag) bool {
+fn isComparisonNode(tag: std.zig.Ast.Node.Tag) bool {
     return switch (tag) {
-        .angle_bracket_left,
-        .angle_bracket_left_equal,
-        .angle_bracket_right,
-        .angle_bracket_right_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
         => true,
         else => false,
     };
 }
 
-fn isBarrier(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .semicolon,
-        .l_brace,
-        .r_brace,
-        .l_paren,
-        .r_paren,
-        .comma,
-        .keyword_and,
-        .keyword_or,
-        .keyword_if,
-        .keyword_while,
-        .keyword_return,
-        => true,
-        else => false,
-    };
-}
-
-/// True when one side of the comparison is a sum and the other side repeats
-/// one of its addends.
-fn addendRepeats(tree: *const Tree, op: usize) bool {
-    const left_start = windowStart(tree, op);
-    const right_end = windowEnd(tree, op);
-
-    const left_sum = hasPlus(tree, left_start, op);
-    const right_sum = hasPlus(tree, op + 1, right_end);
-    if (left_sum == right_sum) return false;
-
-    if (left_sum) {
-        return sharesIdent(tree, left_start, op, op + 1, right_end);
-    }
-    return sharesIdent(tree, op + 1, right_end, left_start, op);
-}
-
-fn windowStart(tree: *const Tree, op: usize) usize {
-    var i = op;
-    while (i > 0) {
-        if (isBarrier(tree.tokens[i - 1].tag)) return i;
-        i -= 1;
-    }
-    return 0;
-}
-
-fn windowEnd(tree: *const Tree, op: usize) usize {
-    var i = op + 1;
-    while (i < tree.tokens.len and !isBarrier(tree.tokens[i].tag)) : (i += 1) {}
-    return i;
-}
-
-fn hasPlus(tree: *const Tree, start: usize, end: usize) bool {
-    var i = start;
-    while (i < end) : (i += 1) {
-        if (tree.tokens[i].tag == .plus or tree.tokens[i].tag == .minus) return true;
-    }
-    return false;
-}
-
-/// True when an identifier appears in both windows.
-fn sharesIdent(
+fn sumsInto(
     tree: *const Tree,
-    a_start: usize,
-    a_end: usize,
-    b_start: usize,
-    b_end: usize,
+    sum_node: std.zig.Ast.Node.Index,
+    other_node: std.zig.Ast.Node.Index,
 ) bool {
-    var i = a_start;
-    while (i < a_end) : (i += 1) {
-        if (tree.tokens[i].tag != .identifier) continue;
-        const name = tree.tokenText(i);
+    const unwrapped_sum = unwrapGrouped(tree, sum_node);
+    if (tree.ast.nodeTag(unwrapped_sum) != .add) return false;
+    const s_lhs, const s_rhs = tree.ast.nodeData(unwrapped_sum).node_and_node;
+    const target = std.mem.trim(u8, tree.ast.getNodeSource(unwrapGrouped(tree, other_node)), " \t");
+    const l_txt = std.mem.trim(u8, tree.ast.getNodeSource(unwrapGrouped(tree, s_lhs)), " \t");
+    const r_txt = std.mem.trim(u8, tree.ast.getNodeSource(unwrapGrouped(tree, s_rhs)), " \t");
+    return std.mem.eql(u8, l_txt, target) or std.mem.eql(u8, r_txt, target);
+}
 
-        var j = b_start;
-        while (j < b_end) : (j += 1) {
-            if (tree.tokens[j].tag != .identifier) continue;
-            if (std.mem.eql(u8, name, tree.tokenText(j))) return true;
-        }
+fn unwrapGrouped(tree: *const Tree, node: std.zig.Ast.Node.Index) std.zig.Ast.Node.Index {
+    var cur = node;
+    while (tree.ast.nodeTag(cur) == .grouped_expression) {
+        cur = tree.ast.nodeData(cur).node_and_token[0];
     }
-    return false;
+    return cur;
+}
+
+test "noPostOverflowCheck flags a + b < a but allows a.start + a.len < a.end and a - b < a" {
+    const src: [:0]const u8 =
+        \\fn f(a: anytype, b: usize) bool {
+        \\    if (a.start + a.len < a.end) return true;
+        \\    if (b - 1 < b) return true;
+        \\    return b + 1 < b;
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    var tree = try Tree.parse(arena.allocator(), src_z, .zig);
+    defer tree.deinit();
+
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "test.zig",
+        .source = src,
+        .diagnostics = &diags,
+    };
+    try noPostOverflowCheck(&ctx, &tree);
+
+    try std.testing.expectEqual(@as(usize, 1), diags.items.len);
+    try std.testing.expectEqual(@as(usize, 4), diags.items[0].span.start_line);
+}
+
+test "safe rules honor comptime, cancel(io), catch undefined, and main defer" {
+    const src: [:0]const u8 =
+        \\pub fn main() void {
+        \\    defer {}
+        \\    std.process.exit(1);
+        \\}
+        \\fn helper(io: anytype, x: anytype) void {
+        \\    comptime { unreachable; }
+        \\    _ = io.cancel(io) catch {};
+        \\    _ = x catch undefined;
+        \\    std.process.exit(2);
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
+    var tree = try Tree.parse(arena.allocator(), src_z, .zig);
+    defer tree.deinit();
+
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "test.zig",
+        .source = src,
+        .diagnostics = &diags,
+    };
+    try noCatchUnreachable(&ctx, &tree);
+    try noSwallowedErrors(&ctx, &tree);
+    try noPanicUnreachable(&ctx, &tree);
+    try noExitInLib(&ctx, &tree);
+
+    try std.testing.expectEqual(@as(usize, 3), diags.items.len);
 }
 
 /// `zig/assert-no-side-effects`: the argument of `std.debug.assert` must be a
@@ -629,26 +682,6 @@ test "isStoreTarget accepts an indexed store and rejects a read" {
     try std.testing.expectEqual(@as(usize, 2), seen);
 }
 
-test "sum window finds the repeated addend" {
-    const a = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-
-    const src = "fn f(a: usize, b: usize) bool { return a + b < a; }\n";
-    const src_z = try arena.allocator().dupeSentinel(u8, src, 0);
-    const tree = try Tree.parse(arena.allocator(), src_z, .zig);
-    var owned = tree;
-    defer owned.deinit();
-
-    var i: usize = 0;
-    while (i < owned.tokens.len) : (i += 1) {
-        if (!isComparisonOp(owned.tokens[i].tag)) continue;
-        try std.testing.expect(addendRepeats(&owned, i));
-        return;
-    }
-    return error.TestUnexpectedResult;
-}
-
 /// `zig/checked-casts`: `@truncate` is lossy by definition, and an `@intCast`
 /// of an arithmetic result can wrap. Without type information the analyzer can
 /// only prove these two shapes; a plain identifier cast is left to review.
@@ -661,7 +694,7 @@ pub fn checkedCasts(ctx: *Context, tree: *const Tree) interface.CheckError!void 
         const is_truncate = std.mem.eql(u8, name, "@truncate");
         const is_int_cast = std.mem.eql(u8, name, "@intCast");
         if (!is_truncate and !is_int_cast) continue;
-        if (ast.inTestBlockToken(tree, i)) continue;
+        if (ast.inTestBlockToken(tree, i) or ast.inComptimeBlockToken(tree, i)) continue;
 
         const open = nextParen(tree, i) orelse continue;
         const close = closingParen(tree, open) orelse continue;

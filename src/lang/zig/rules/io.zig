@@ -26,15 +26,7 @@ pub fn ioParameterThreading(ctx: *Context, tree: *const Tree) interface.CheckErr
         // Only a function that performs I/O can be missing its `io` handle.
         if (!fnMentionsIo(tree, i)) continue;
 
-        var params: std.ArrayList([]const u8) = .empty;
-        defer params.deinit(ctx.allocator);
-        ast.paramNames(tree, i, &params) catch continue;
-
-        var has_io = false;
-        for (params.items) |name| {
-            if (std.mem.eql(u8, name, "io")) has_io = true;
-        }
-        if (has_io) continue;
+        if (fnHasIoOrContextParam(ctx.allocator, tree, i)) continue;
 
         try ctx.report(
             "zig/io-parameter-threading",
@@ -43,6 +35,35 @@ pub fn ioParameterThreading(ctx: *Context, tree: *const Tree) interface.CheckErr
             "Thread an 'std.Io' parameter through the call chain",
         );
     }
+}
+
+fn fnHasIoOrContextParam(allocator: std.mem.Allocator, tree: *const Tree, fn_decl: usize) bool {
+    var params: std.ArrayList([]const u8) = .empty;
+    defer params.deinit(allocator);
+    ast.paramNames(tree, fn_decl, &params) catch return true;
+
+    for (params.items) |name| {
+        if (std.mem.eql(u8, name, "io") or std.mem.eql(u8, name, "ctx") or
+            std.mem.eql(u8, name, "context"))
+        {
+            return true;
+        }
+    }
+
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const proto = tree.ast.fullFnProto(&buffer, tree.nodeAt(fn_decl)) orelse return false;
+    var it = proto.iterate(&tree.ast);
+    while (it.next()) |param| {
+        const type_expr = param.type_expr orelse continue;
+        const type_txt = tree.ast.getNodeSource(type_expr);
+        if (std.mem.indexOf(u8, type_txt, "std.Io") != null or
+            std.mem.eql(u8, std.mem.trim(u8, type_txt, " \t"), "Io") or
+            std.mem.indexOf(u8, type_txt, "Context") != null)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn fnMentionsIo(tree: *const Tree, fn_decl: usize) bool {
@@ -64,20 +85,28 @@ fn fnMentionsIo(tree: *const Tree, fn_decl: usize) bool {
     return false;
 }
 
-/// `zig/writer-flush`: a buffered writer is flushed or ended on every path.
+/// `zig/writer-flush`: a locally created buffered writer is flushed or ended on every path.
 /// Heuristic: off by default.
 pub fn writerFlush(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     var i: usize = 0;
-    while (i < tree.tokens.len) : (i += 1) {
-        if (tree.tokens[i].tag != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenText(i), "writer")) continue;
+    while (i < tree.nodeCount()) : (i += 1) {
+        const tag = tree.tag(i);
+        const is_decl = tag == .local_var_decl or tag == .simple_var_decl or
+            tag == .aligned_var_decl;
+        if (!is_decl) continue;
 
-        const fn_decl = ast.fnAtOffset(tree, tree.tokens[i].start) orelse continue;
+        const decl = tree.ast.fullVarDecl(tree.nodeAt(i)) orelse continue;
+        if (tree.ast.tokenTag(decl.ast.mut_token) != .keyword_var) continue;
+        const init_idx = decl.ast.init_node.unwrap() orelse continue;
+        const init_txt = tree.ast.getNodeSource(init_idx);
+        if (std.mem.indexOf(u8, init_txt, ".writer(") == null) continue;
+
+        const fn_decl = ast.fnAtOffset(tree, tree.nodeBytes(i).start) orelse continue;
         if (hasFlushInFunction(tree, fn_decl)) continue;
 
         try ctx.report(
             "zig/writer-flush",
-            tree.tokenSpan(i),
+            tree.nodeSpan(i),
             "Buffered writer with no flush on this path",
             "Call 'flush()' or 'end()' before the function returns",
         );
@@ -104,6 +133,7 @@ pub fn asyncCancel(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     while (i < tree.tokens.len) : (i += 1) {
         if (tree.tokens[i].tag != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenText(i), "async")) continue;
+        if (i == 0 or tree.tokens[i - 1].tag != .period) continue;
 
         const fn_decl = ast.fnAtOffset(tree, tree.tokens[i].start) orelse continue;
         if (hasAwaitOrCancel(tree, fn_decl)) continue;
@@ -179,9 +209,9 @@ pub fn concurrencyFallback(ctx: *Context, tree: *const Tree) interface.CheckErro
     while (i < tree.tokens.len) : (i += 1) {
         if (tree.tokens[i].tag != .identifier) continue;
         if (!std.mem.eql(u8, tree.tokenText(i), "concurrent")) continue;
-        if (i > 0 and !std.mem.eql(u8, tree.tokenText(i - 1), "io")) {
-            if (i < 2 or tree.tokens[i - 2].tag != .period) continue;
-        }
+        if (i < 2 or tree.tokens[i - 1].tag != .period) continue;
+        if (tree.tokens[i - 2].tag != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenText(i - 2), "io")) continue;
 
         const fn_decl = ast.fnAtOffset(tree, tree.tokens[i].start) orelse continue;
         if (hasConcurrencyFallback(tree, fn_decl)) continue;
@@ -238,10 +268,16 @@ pub fn noDirectPosix(ctx: *Context, tree: *const Tree) interface.CheckError!void
     while (i < tree.tokens.len) : (i += 1) {
         if (tree.tokens[i].tag != .identifier) continue;
         const name = tree.tokenText(i);
-        const is_posix = std.mem.eql(u8, name, "posix");
-        const is_os_linux = std.mem.eql(u8, name, "linux") and i > 1 and
+        const is_std_posix = std.mem.eql(u8, name, "posix") and i >= 2 and
+            tree.tokens[i - 1].tag == .period and
+            std.mem.eql(u8, tree.tokenText(i - 2), "std");
+        const is_posix_system = std.mem.eql(u8, name, "posix") and i + 2 < tree.tokens.len and
+            tree.tokens[i + 1].tag == .period and
+            std.mem.eql(u8, tree.tokenText(i + 2), "system");
+        const is_os_linux = std.mem.eql(u8, name, "linux") and i >= 2 and
+            tree.tokens[i - 1].tag == .period and
             std.mem.eql(u8, tree.tokenText(i - 2), "os");
-        if (!is_posix and !is_os_linux) continue;
+        if (!is_std_posix and !is_posix_system and !is_os_linux) continue;
 
         try ctx.report(
             "zig/no-direct-posix",

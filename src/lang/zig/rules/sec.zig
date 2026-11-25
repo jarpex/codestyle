@@ -8,14 +8,15 @@ const Tree = ast.Tree;
 /// Names that mark a value as key material. A comparison or an `@memset` on
 /// one of these is a timing or a zeroization hazard.
 const secret_names = [_][]const u8{
-    "key",
+    "api_key",
+    "priv_key",
+    "auth_token",
+    "session_token",
     "secret",
-    "token",
     "password",
     "passwd",
     "nonce",
     "salt",
-    "mac",
     "signature",
     "hmac",
 };
@@ -172,8 +173,11 @@ fn collectCallArgs(
 
 test "secret name matching is case insensitive" {
     try std.testing.expect(nameIsSecret("api_key"));
+    try std.testing.expect(nameIsSecret("auth_token"));
     try std.testing.expect(nameIsSecret("hmac"));
-    try std.testing.expect(nameIsSecret("KEY"));
+    try std.testing.expect(!nameIsSecret("key"));
+    try std.testing.expect(!nameIsSecret("token"));
+    try std.testing.expect(!nameIsSecret("mac"));
     try std.testing.expect(!nameIsSecret("keyword"));
     try std.testing.expect(!nameIsSecret("buffer"));
 }

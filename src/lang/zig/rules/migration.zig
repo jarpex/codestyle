@@ -137,14 +137,10 @@ pub const migrations = [_]Migration{
 /// breaks the build, the compiler already refuses the old name.
 pub fn run(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     for (migrations) |migration| {
+        const dot = std.mem.indexOfScalar(u8, migration.needle, '.');
         var i: usize = 0;
         while (i < tree.tokens.len) : (i += 1) {
-            const token = tree.tokens[i];
-            if (token.tag != .identifier and token.tag != .builtin) continue;
-
-            const text = tree.tokenText(i);
-            if (!containsSymbol(text, migration.needle)) continue;
-            if (migration.requires_init_call and !followedByInit(tree, i)) continue;
+            if (!matchesMigration(tree, i, migration, dot)) continue;
 
             try ctx.report(
                 migration.rule_id,
@@ -154,6 +150,25 @@ pub fn run(ctx: *Context, tree: *const Tree) interface.CheckError!void {
             );
         }
     }
+}
+
+fn matchesMigration(tree: *const Tree, i: usize, m: Migration, dot: ?usize) bool {
+    const token = tree.tokens[i];
+    if (token.tag != .identifier and token.tag != .builtin) return false;
+
+    const d = dot orelse {
+        if (!containsSymbol(tree.tokenText(i), m.needle)) return false;
+        return !m.requires_init_call or followedByInit(tree, i);
+    };
+
+    const left = m.needle[0..d];
+    const right = m.needle[d + 1 ..];
+    if (!std.mem.eql(u8, tree.tokenText(i), left)) return false;
+    if (i + 2 >= tree.tokens.len) return false;
+    if (tree.tokens[i + 1].tag != .period) return false;
+    if (tree.tokens[i + 2].tag != .identifier) return false;
+    if (!std.mem.eql(u8, tree.tokenText(i + 2), right)) return false;
+    return !m.requires_init_call or followedByInit(tree, i + 2);
 }
 
 /// True when the token is followed by `.init(`, the stateful constructor. A
@@ -237,7 +252,7 @@ pub fn readFileAllocOrder(ctx: *Context, tree: *const Tree) interface.CheckError
     }
 }
 
-/// Wave 2 quiet semantic migration checks from `docs/zig-0.16-migration.md`.
+/// Wave 2 quiet semantic migration checks from `docs/zig-migration.md`.
 pub fn wave2(ctx: *Context, tree: *const Tree) interface.CheckError!void {
     const has_rename = hasToken(tree, "rename");
     const has_mmap = hasToken(tree, "MemoryMap") or hasToken(tree, "memoryMap");
@@ -394,6 +409,7 @@ fn isFallibleComponentIter(tree: *const Tree, idx: usize) bool {
 
 /// Zig 0.17 migration checks: `errdefer |err|`, array `**`, and `b.args`.
 pub fn wave017(ctx: *Context, tree: *const Tree) interface.CheckError!void {
+    const is_build_zig = std.mem.eql(u8, std.Io.Dir.path.basename(ctx.file_path), "build.zig");
     var i: usize = 0;
     while (i < tree.tokens.len) : (i += 1) {
         const tag = tree.tokens[i].tag;
@@ -406,16 +422,15 @@ pub fn wave017(ctx: *Context, tree: *const Tree) interface.CheckError!void {
                 "errdefer payload capture is removed in 0.17",
                 "Remove '|err|' from 'errdefer'",
             );
-        } else if (tag == .asterisk and i + 1 < tree.tokens.len and
-            tree.tokens[i + 1].tag == .asterisk)
-        {
+        } else if (isArrayMul(tree, i)) {
             try ctx.report(
                 "zig/removed-array-mul",
                 tree.tokenSpan(i),
                 "Array multiplication operator '**' is removed in 0.17",
                 "Use '@splat(value)' instead of '**'",
             );
-        } else if (tag == .identifier and std.mem.eql(u8, tree.tokenText(i), "args") and
+        } else if (is_build_zig and tag == .identifier and
+            std.mem.eql(u8, tree.tokenText(i), "args") and
             i >= 2 and tree.tokens[i - 1].tag == .period and
             tree.tokens[i - 2].tag == .identifier and
             std.mem.eql(u8, tree.tokenText(i - 2), "b"))
@@ -428,6 +443,24 @@ pub fn wave017(ctx: *Context, tree: *const Tree) interface.CheckError!void {
             );
         }
     }
+}
+
+fn isArrayMul(tree: *const Tree, i: usize) bool {
+    if (tree.tokens[i].tag != .asterisk) return false;
+    if (i == 0 or i + 1 >= tree.tokens.len) return false;
+    if (tree.tokens[i + 1].tag != .asterisk) return false;
+    if (tree.tokens[i].end != tree.tokens[i + 1].start) return false;
+    return switch (tree.tokens[i - 1].tag) {
+        .identifier,
+        .r_paren,
+        .r_bracket,
+        .r_brace,
+        .string_literal,
+        .number_literal,
+        .char_literal,
+        => true,
+        else => false,
+    };
 }
 
 test "migration table has no duplicate needles per rule" {
@@ -481,6 +514,7 @@ test "wave2 migration rules detect 0.16 quiet semantic changes" {
         .file_path = "test.zig",
         .source = src,
         .diagnostics = &diags,
+        .profile = .migration,
     };
     try wave2(&ctx, &tree);
 
@@ -493,6 +527,87 @@ test "wave2 migration rules detect 0.16 quiet semantic changes" {
         "zig/clock-error-sets",
         "zig/component-iterator-infallible",
         "zig/tar-traversal-sanitize",
+    };
+    for (expected) |id| {
+        var found = false;
+        for (diags.items) |d| {
+            if (std.mem.eql(u8, d.rule_id, id)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "wave017 distinguishes array ** from **T and restricts b.args to build.zig" {
+    const src: [:0]const u8 =
+        \\fn f(p: **u8, b: anytype) void {
+        \\    _ = p;
+        \\    _ = b.args;
+        \\    _ = "x" ** 4;
+        \\    errdefer |err| _ = err;
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tree = try Tree.parse(arena.allocator(), src, .zig);
+    defer tree.deinit();
+
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "build.zig",
+        .source = src,
+        .diagnostics = &diags,
+        .profile = .migration,
+    };
+    try wave017(&ctx, &tree);
+
+    var mul_count: usize = 0;
+    var build_args_count: usize = 0;
+    var errdefer_count: usize = 0;
+    for (diags.items) |d| {
+        if (std.mem.eql(u8, d.rule_id, "zig/removed-array-mul")) mul_count += 1;
+        if (std.mem.eql(u8, d.rule_id, "zig/removed-build-args")) build_args_count += 1;
+        if (std.mem.eql(u8, d.rule_id, "zig/removed-errdefer-capture")) errdefer_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), mul_count);
+    try std.testing.expectEqual(@as(usize, 1), build_args_count);
+    try std.testing.expectEqual(@as(usize, 1), errdefer_count);
+}
+
+test "dotted migration needles match across period tokens" {
+    const src: [:0]const u8 =
+        \\fn f() void {
+        \\    _ = std.once;
+        \\    _ = std.Thread.Pool;
+        \\    _ = std.Thread.Mutex.Recursive;
+        \\    _ = std.process.Child;
+        \\    _ = std.time;
+        \\    _ = std.fs.path;
+        \\    _ = std.fs.cwd;
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tree = try Tree.parse(arena.allocator(), src, .zig);
+    defer tree.deinit();
+    var diags = std.ArrayList(@import("../../../core/diagnostic.zig").Diagnostic).empty;
+    var ctx = Context{
+        .allocator = arena.allocator(),
+        .file_path = "test.zig",
+        .source = src,
+        .diagnostics = &diags,
+        .profile = .migration,
+    };
+    try run(&ctx, &tree);
+
+    const expected = [_][]const u8{
+        "zig/removed-std-once",
+        "zig/removed-thread-pool",
+        "zig/removed-thread-mutex-recursive",
+        "zig/renamed-process-child",
+        "zig/renamed-std-time",
+        "zig/renamed-fs-path",
+        "zig/renamed-fs-cwd",
     };
     for (expected) |id| {
         var found = false;

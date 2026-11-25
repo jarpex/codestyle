@@ -12,6 +12,12 @@ pub const Mode = enum {
     }
 };
 
+pub const Range = struct {
+    start: usize,
+    end: usize,
+    index: usize,
+};
+
 /// A parsed file plus the indexes the rules read. Every field is owned by the
 /// caller's arena, so `deinit` only releases what `parse` allocated.
 pub const Tree = struct {
@@ -20,31 +26,47 @@ pub const Tree = struct {
     ast: std.zig.Ast,
     tokens: []scan.Token,
     lines: scan.LineIndex,
+    test_ranges: []Range,
+    fn_ranges: []Range,
+    enum_ranges: []Range,
+    block_ranges: []Range,
 
     pub fn parse(
         allocator: std.mem.Allocator,
         source: [:0]const u8,
         mode: Mode,
     ) interface.CheckError!Tree {
-        const ast = try std.zig.Ast.parse(allocator, source, .{
+        var ast = try std.zig.Ast.parse(allocator, source, .{
             .mode = switch (mode) {
                 .zig => .zig,
                 .zon => .zon,
             },
         });
-        return .{
+        errdefer ast.deinit(allocator);
+
+        var tree = Tree{
             .allocator = allocator,
             .source = source,
             .ast = ast,
-            .tokens = try scan.tokenize(allocator, source),
+            .tokens = try scan.tokensFromAst(allocator, &ast),
             .lines = try scan.LineIndex.init(allocator, source),
+            .test_ranges = &.{},
+            .fn_ranges = &.{},
+            .enum_ranges = &.{},
+            .block_ranges = &.{},
         };
+        try buildRangeIndexes(allocator, &tree);
+        return tree;
     }
 
     pub fn deinit(self: *Tree) void {
         self.ast.deinit(self.allocator);
         self.allocator.free(self.tokens);
         self.allocator.free(self.lines.starts);
+        self.allocator.free(self.test_ranges);
+        self.allocator.free(self.fn_ranges);
+        self.allocator.free(self.enum_ranges);
+        self.allocator.free(self.block_ranges);
     }
 
     pub fn nodeCount(self: *const Tree) usize {
@@ -123,27 +145,67 @@ pub fn inTestBlock(tree: *const Tree, index: usize) bool {
 /// the serialized schema, so the naming rules skip them.
 pub fn fieldIsExternalSchema(tree: *const Tree, index: usize) bool {
     const target = tree.nodeBytes(index);
+    return fieldIsExternalSchemaAt(tree, target.start);
+}
+
+/// True when `offset` sits inside a container that defines `jsonStringify`.
+pub fn fieldIsExternalSchemaAt(tree: *const Tree, offset: usize) bool {
     var i: usize = 0;
     while (i < tree.nodeCount()) : (i += 1) {
         if (!isContainerTag(tree.tag(i))) continue;
         const b = tree.nodeBytes(i);
-        if (b.start > target.start or b.end < target.end) continue;
+        if (b.start > offset or b.end < offset) continue;
         if (containerDeclaresJsonStringify(tree, i)) return true;
     }
     return false;
+}
+
+fn buildRangeIndexes(allocator: std.mem.Allocator, tree: *Tree) interface.CheckError!void {
+    var tests: std.ArrayList(Range) = .empty;
+    var fns: std.ArrayList(Range) = .empty;
+    var enums: std.ArrayList(Range) = .empty;
+    var blocks: std.ArrayList(Range) = .empty;
+    errdefer {
+        tests.deinit(allocator);
+        fns.deinit(allocator);
+        enums.deinit(allocator);
+        blocks.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < tree.nodeCount()) : (i += 1) {
+        const tag = tree.tag(i);
+        if (tag == .test_decl) {
+            const b = tree.nodeBytes(i);
+            try tests.append(allocator, .{ .start = b.start, .end = b.end, .index = i });
+        } else if (tag == .fn_decl) {
+            const b = fnBytes(tree, i);
+            try fns.append(allocator, .{ .start = b.start, .end = b.end, .index = i });
+        } else if (isContainerTag(tag) and
+            tree.tokenTag(tree.ast.nodeMainToken(tree.nodeAt(i))) == .keyword_enum)
+        {
+            const b = tree.nodeBytes(i);
+            try enums.append(allocator, .{ .start = b.start, .end = b.end, .index = i });
+        } else if (tag == .block or tag == .block_two or
+            tag == .block_two_semicolon or tag == .block_semicolon)
+        {
+            const b = tree.nodeBytes(i);
+            try blocks.append(allocator, .{ .start = b.start, .end = b.end, .index = i });
+        }
+    }
+
+    tree.test_ranges = try tests.toOwnedSlice(allocator);
+    tree.fn_ranges = try fns.toOwnedSlice(allocator);
+    tree.enum_ranges = try enums.toOwnedSlice(allocator);
+    tree.block_ranges = try blocks.toOwnedSlice(allocator);
 }
 
 /// True when `index` sits inside an `enum { ... }` body, whose members are
 /// tags rather than fields.
 pub fn isInsideEnum(tree: *const Tree, index: usize) bool {
     const inner = tree.nodeBytes(index);
-    var i: usize = 0;
-    while (i < tree.nodeCount()) : (i += 1) {
-        if (!isContainerTag(tree.tag(i))) continue;
-        if (tree.tokenTag(tree.ast.nodeMainToken(tree.nodeAt(i))) != .keyword_enum) continue;
-
-        const outer = tree.nodeBytes(i);
-        if (inner.start >= outer.start and inner.end <= outer.end) return true;
+    for (tree.enum_ranges) |r| {
+        if (inner.start >= r.start and inner.end <= r.end) return true;
     }
     return false;
 }
@@ -182,18 +244,8 @@ fn containerDeclaresJsonStringify(tree: *const Tree, index: usize) bool {
 /// True when `offset` sits inside any `{ ... }` block. A container-scope
 /// declaration is never inside one, so this separates locals from globals.
 pub fn insideBlock(tree: *const Tree, offset: usize) bool {
-    var i: usize = 0;
-    while (i < tree.nodeCount()) : (i += 1) {
-        switch (tree.tag(i)) {
-            .block,
-            .block_two,
-            .block_two_semicolon,
-            .block_semicolon,
-            => {},
-            else => continue,
-        }
-        const b = tree.nodeBytes(i);
-        if (b.start <= offset and offset <= b.end) return true;
+    for (tree.block_ranges) |r| {
+        if (r.start <= offset and offset <= r.end) return true;
     }
     return false;
 }
@@ -205,9 +257,19 @@ pub fn inTestBlockToken(tree: *const Tree, token_index: usize) bool {
 }
 
 pub fn inTestBlockAt(tree: *const Tree, offset: usize) bool {
+    for (tree.test_ranges) |r| {
+        if (r.start <= offset and offset <= r.end) return true;
+    }
+    return false;
+}
+
+/// True when the token at `token_index` sits inside a `comptime` block or expression.
+pub fn inComptimeBlockToken(tree: *const Tree, token_index: usize) bool {
+    if (token_index >= tree.tokens.len) return false;
+    const offset = tree.tokens[token_index].start;
     var i: usize = 0;
     while (i < tree.nodeCount()) : (i += 1) {
-        if (tree.tag(i) != .test_decl) continue;
+        if (tree.tag(i) != .@"comptime") continue;
         const b = tree.nodeBytes(i);
         if (b.start <= offset and offset <= b.end) return true;
     }
@@ -225,8 +287,10 @@ pub fn importsStruct(
 ) bool {
     if (import_path.len == 0 or std.mem.startsWith(u8, import_path, "/")) return false;
 
-    const dir_path = std.fs.path.dirname(from) orelse ".";
-    const joined = std.fs.path.join(allocator, &.{ dir_path, import_path }) catch return false;
+    const dir_path = std.Io.Dir.path.dirname(from) orelse ".";
+    const joined = std.Io.Dir.path.join(allocator, &.{ dir_path, import_path }) catch {
+        return false;
+    };
     defer allocator.free(joined);
 
     const source = std.Io.Dir.cwd()
@@ -315,14 +379,11 @@ pub fn fnAtOffset(tree: *const Tree, offset: usize) ?usize {
     var best: ?usize = null;
     var best_start: usize = 0;
 
-    var i: usize = 0;
-    while (i < tree.nodeCount()) : (i += 1) {
-        if (tree.tag(i) != .fn_decl) continue;
-        const b = fnBytes(tree, i);
-        if (b.start > offset or b.end < offset) continue;
-        if (best == null or b.start >= best_start) {
-            best = i;
-            best_start = b.start;
+    for (tree.fn_ranges) |r| {
+        if (r.start > offset or r.end < offset) continue;
+        if (best == null or r.start >= best_start) {
+            best = r.index;
+            best_start = r.start;
         }
     }
     return best;
