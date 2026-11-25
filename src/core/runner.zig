@@ -7,6 +7,7 @@ const registry = @import("../lang/registry.zig");
 const interface = @import("../lang/interface.zig");
 const Context = interface.Context;
 const config = @import("config.zig");
+const ast_rules = @import("../lang/c/ast_rules.zig");
 
 pub const RunnerOptions = struct {
     format: reporter.Format = .clippy,
@@ -97,6 +98,18 @@ pub fn run(
         if (parser) |p| ts.c.ts_parser_delete(p);
     }
 
+    var header_symbols = std.StringHashMap(void).init(config_arena.allocator());
+    try collectCHeaderSymbols(
+        config_arena.allocator(),
+        &file_arena,
+        io,
+        file_paths.items,
+        &parser,
+        &header_symbols,
+    );
+    const c_header_symbols: ?*const std.StringHashMap(void) =
+        if (header_symbols.count() > 0) &header_symbols else null;
+
     var file_reports = std.ArrayList(reporter.FileReport).empty;
     defer {
         if (options.format == .sarif) {
@@ -140,6 +153,7 @@ pub fn run(
             .text = lang.text,
             .io = io,
             .allow = allowlists,
+            .c_header_symbols = c_header_symbols,
         };
 
         lang.run_raw_checks(&ctx) catch |err| {
@@ -210,6 +224,89 @@ pub fn run(
     }
 
     return if (has_errors) 1 else 0;
+}
+
+fn collectCHeaderSymbolsFromFile(
+    out_alloc: std.mem.Allocator,
+    file_arena: *std.heap.ArenaAllocator,
+    io: std.Io,
+    header_path: []const u8,
+    max_size: usize,
+    parser: *?*ts.c.TSParser,
+    grammar: *const ts.c.TSLanguage,
+    out: *std.StringHashMap(void),
+) !void {
+    _ = file_arena.reset(.retain_capacity);
+    const source = std.Io.Dir.cwd()
+        .readFileAlloc(io, header_path, file_arena.allocator(), .limited(max_size)) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return;
+    };
+    if (parser.* == null) parser.* = ts.c.ts_parser_new();
+    const p = parser.*.?;
+    _ = ts.c.ts_parser_set_language(p, grammar);
+    const tree = ts.c.ts_parser_parse_string(
+        p,
+        null,
+        source.ptr,
+        @intCast(source.len),
+    ) orelse return;
+    defer ts.c.ts_tree_delete(tree);
+    try ast_rules.collectHeaderSymbols(out_alloc, tree, source, out);
+}
+
+fn collectCHeaderSymbols(
+    out_alloc: std.mem.Allocator,
+    file_arena: *std.heap.ArenaAllocator,
+    io: std.Io,
+    file_paths: []const []const u8,
+    parser: *?*ts.c.TSParser,
+    out: *std.StringHashMap(void),
+) !void {
+    var has_c = false;
+    var has_h = false;
+    for (file_paths) |p| {
+        if (std.mem.endsWith(u8, p, ".c")) has_c = true;
+        if (std.mem.endsWith(u8, p, ".h")) has_h = true;
+    }
+    if (!has_c) return;
+
+    const c_lang = registry.findByExtension(".c") orelse return;
+    const grammar_fn = c_lang.get_grammar orelse return;
+    const grammar = grammar_fn() orelse return;
+
+    if (has_h) {
+        for (file_paths) |p| {
+            if (!std.mem.endsWith(u8, p, ".h")) continue;
+            try collectCHeaderSymbolsFromFile(
+                out_alloc,
+                file_arena,
+                io,
+                p,
+                c_lang.max_file_size,
+                parser,
+                grammar,
+                out,
+            );
+        }
+        return;
+    }
+
+    for (file_paths) |p| {
+        if (!std.mem.endsWith(u8, p, ".c")) continue;
+        const stem = p[0 .. p.len - 2];
+        const sibling_h = try std.fmt.allocPrint(out_alloc, "{s}.h", .{stem});
+        try collectCHeaderSymbolsFromFile(
+            out_alloc,
+            file_arena,
+            io,
+            sibling_h,
+            c_lang.max_file_size,
+            parser,
+            grammar,
+            out,
+        );
+    }
 }
 
 /// One line naming how many findings a directive removed and for which rules.

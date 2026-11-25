@@ -22,14 +22,15 @@ fn isBlank(c: u8) bool {
     return c == ' ' or c == '\t';
 }
 
-/// A block comment continuation line aligns its `*` with one space or one tab.
-/// Indentation rules skip those lines so a comment body keeps its shape.
+/// A block comment continuation or closing line aligns its `*` with spaces
+/// after the leading tabs (e.g. ` * text`, ` *`, or ` */`). Indentation rules
+/// skip those lines so a comment body keeps its shape.
 fn isCommentContinuation(line: []const u8) bool {
     var i: usize = 0;
     while (i < line.len and isBlank(line[i])) : (i += 1) {}
-    if (i + 1 >= line.len) return false;
-    if (line[i] != '*') return false;
-    return line[i + 1] == ' ' or line[i + 1] == '\t';
+    if (i >= line.len or line[i] != '*') return false;
+    if (i + 1 == line.len) return true;
+    return line[i + 1] == ' ' or line[i + 1] == '\t' or line[i + 1] == '/';
 }
 
 fn checkIndent(

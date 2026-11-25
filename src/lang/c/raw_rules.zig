@@ -105,9 +105,14 @@ test "style/indent requires tabs and skips comment continuations" {
         "int main(void) {\n" ++
         "    int x = 1;\n" ++
         "\tint y = 2;\n" ++
+        "/*\n" ++
+        " * top-level doc comment\n" ++
+        " *\n" ++
+        " */\n" ++
         "\t/*\n" ++
-        "\t* comment continuation\n" ++
-        "\t*/\n" ++
+        "\t * indented comment continuation\n" ++
+        "\t *\n" ++
+        "\t */\n" ++
         "\t* another continuation\n" ++
         "\t int z = 3;\n" ++
         "}\n";

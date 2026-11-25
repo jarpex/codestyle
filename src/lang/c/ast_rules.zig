@@ -387,16 +387,25 @@ fn isType(ntype: []const u8, name: []const u8) bool {
     return std.mem.eql(u8, ntype, name);
 }
 
-/// Text of the innermost identifier of a declarator, peeling the
-/// `function_declarator` and `pointer_declarator` wrappers first.
+/// Text of the innermost identifier of a declarator, peeling wrappers first.
 fn declaratorName(decl: ts.c.TSNode, source: []const u8) []const u8 {
     var inner = decl;
-    while (isType(ts.getNodeType(inner), "function_declarator") or
-        isType(ts.getNodeType(inner), "pointer_declarator"))
-    {
-        const next_inner = ts.childByField(inner, "declarator");
-        if (ts.isNull(next_inner)) break;
-        inner = next_inner;
+    while (true) {
+        const t = ts.getNodeType(inner);
+        if (isType(t, "function_declarator") or isType(t, "pointer_declarator") or
+            isType(t, "array_declarator") or isType(t, "init_declarator"))
+        {
+            const next_inner = ts.childByField(inner, "declarator");
+            if (ts.isNull(next_inner)) break;
+            inner = next_inner;
+            continue;
+        }
+        if (isType(t, "parenthesized_declarator")) {
+            if (ts.namedChildCount(inner) == 0) break;
+            inner = ts.namedChild(inner, 0);
+            continue;
+        }
+        break;
     }
     return ts.getNodeText(inner, source);
 }
@@ -407,7 +416,13 @@ fn checkInternalLinkage(ctx: *Context, node: ts.c.TSNode) interface.CheckError!v
     if (hasStorageClass(node, ctx.source, "extern")) return;
 
     const decl = ts.childByField(node, "declarator");
-    if (!ts.isNull(decl) and std.mem.eql(u8, declaratorName(decl, ctx.source), "main")) return;
+    if (!ts.isNull(decl)) {
+        const name = declaratorName(decl, ctx.source);
+        if (std.mem.eql(u8, name, "main")) return;
+        if (ctx.c_header_symbols) |syms| {
+            if (syms.contains(name)) return;
+        }
+    }
 
     try ctx.report(
         "c/internal-linkage",
@@ -517,8 +532,9 @@ fn checkDeclaratorInitialised(ctx: *Context, stmt: ts.c.TSNode) interface.CheckE
             if (ts.isNull(ts.childByField(dchild, "value"))) try reportUninitialised(ctx, dchild);
             continue;
         }
-        if (isType(dt, "identifier") or isType(dt, "array_declarator") or
-            isType(dt, "pointer_declarator")) try reportUninitialised(ctx, dchild);
+        if (isType(dt, "identifier") or isType(dt, "pointer_declarator")) {
+            try reportUninitialised(ctx, dchild);
+        }
     }
 }
 
@@ -562,12 +578,44 @@ fn checkFunctionDefinition(ctx: *Context, node: ts.c.TSNode) interface.CheckErro
     if (!ts.isNull(body)) try checkStatementsAtTop(ctx, body);
 }
 
-/// `c/explicit-int-types`: bare `int` and sized specifiers outside `main`.
+fn isCharSizedSpecifier(node: ts.c.TSNode, source: []const u8) bool {
+    return hasChildOfTypeAndText(node, source, "primitive_type", "char");
+}
+
+fn isPrintfCastNode(node: ts.c.TSNode, source: []const u8) bool {
+    const type_desc = ts.parent(node) orelse return false;
+    if (!isType(ts.getNodeType(type_desc), "type_descriptor")) return false;
+
+    const cast = ts.parent(type_desc) orelse return false;
+    if (!isType(ts.getNodeType(cast), "cast_expression")) return false;
+
+    var cur = ts.parent(cast);
+    while (cur) |n| {
+        const nt = ts.getNodeType(n);
+        if (isType(nt, "argument_list")) {
+            const call = ts.parent(n) orelse return false;
+            if (!isType(ts.getNodeType(call), "call_expression")) return false;
+            const func = ts.childByField(call, "function");
+            if (ts.isNull(func)) return false;
+            return std.mem.endsWith(u8, ts.getNodeText(func, source), "printf");
+        }
+        if (isType(nt, "compound_statement") or isType(nt, "function_definition") or
+            isType(nt, "declaration")) return false;
+        cur = ts.parent(n);
+    }
+    return false;
+}
+
+/// `c/explicit-int-types`: bare `int` and sized specifiers outside `main`,
+/// `unsigned char` / `signed char`, and casts inside `*printf()` calls.
 fn checkExplicitIntTypes(
     ctx: *Context,
     node: ts.c.TSNode,
     fn_node: ?ts.c.TSNode,
 ) interface.CheckError!void {
+    if (isType(ts.getNodeType(node), "sized_type_specifier") and
+        isCharSizedSpecifier(node, ctx.source)) return;
+    if (isPrintfCastNode(node, ctx.source)) return;
     if (fn_node) |definition| {
         if (isMainSignatureNode(definition, node, ctx.source)) return;
     }
@@ -1186,6 +1234,86 @@ fn visit(
     return state;
 }
 
+fn isHeaderContainer(t: []const u8) bool {
+    return isType(t, "translation_unit") or isType(t, "preproc_ifdef") or
+        isType(t, "preproc_if") or isType(t, "preproc_else") or
+        isType(t, "preproc_elif") or isType(t, "linkage_specification") or
+        isType(t, "declaration_list");
+}
+
+fn isDeclaratorNode(t: []const u8) bool {
+    return isType(t, "identifier") or isType(t, "function_declarator") or
+        isType(t, "pointer_declarator") or isType(t, "array_declarator") or
+        isType(t, "parenthesized_declarator") or isType(t, "init_declarator");
+}
+
+fn putHeaderSymbol(
+    allocator: std.mem.Allocator,
+    decl: ts.c.TSNode,
+    source: []const u8,
+    out: *std.StringHashMap(void),
+) error{OutOfMemory}!void {
+    const name = declaratorName(decl, source);
+    if (name.len == 0 or out.contains(name)) return;
+    try out.put(try allocator.dupe(u8, name), {});
+}
+
+fn collectDeclarationSymbols(
+    allocator: std.mem.Allocator,
+    node: ts.c.TSNode,
+    source: []const u8,
+    out: *std.StringHashMap(void),
+) error{OutOfMemory}!void {
+    var ci: u32 = 0;
+    const count = ts.namedChildCount(node);
+    while (ci < count) : (ci += 1) {
+        const child = ts.namedChild(node, ci);
+        if (ts.isNull(child) or !isDeclaratorNode(ts.getNodeType(child))) continue;
+        try putHeaderSymbol(allocator, child, source, out);
+    }
+}
+
+/// Collect non-`static` top-level function and variable declarations from a C
+/// header AST so `c/internal-linkage` does not flag public API definitions.
+pub fn collectHeaderSymbols(
+    allocator: std.mem.Allocator,
+    tree: *const ts.c.TSTree,
+    source: []const u8,
+    out: *std.StringHashMap(void),
+) error{OutOfMemory}!void {
+    const root = ts.c.ts_tree_root_node(tree);
+    if (ts.isNull(root)) return;
+
+    var stack = std.ArrayList(ts.c.TSNode).empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, root);
+
+    while (stack.items.len > 0) {
+        const node = stack.pop().?;
+        if (ts.isNull(node)) continue;
+
+        const ntype = ts.getNodeType(node);
+        if (isHeaderContainer(ntype)) {
+            var ci: u32 = ts.namedChildCount(node);
+            while (ci > 0) {
+                ci -= 1;
+                try stack.append(allocator, ts.namedChild(node, ci));
+            }
+            continue;
+        }
+        if (hasStorageClass(node, source, "static")) continue;
+
+        if (isType(ntype, "function_definition")) {
+            const decl = ts.childByField(node, "declarator");
+            if (!ts.isNull(decl)) try putHeaderSymbol(allocator, decl, source, out);
+            continue;
+        }
+        if (isType(ntype, "declaration")) {
+            try collectDeclarationSymbols(allocator, node, source, out);
+        }
+    }
+}
+
 fn checkSource(source: []const u8, file_path: []const u8) !std.ArrayList(diagnostic.Diagnostic) {
     const parser = ts.c.ts_parser_new();
     defer ts.c.ts_parser_delete(parser);
@@ -1528,6 +1656,112 @@ test "c/local-macro-undef ignores top-of-file macros" {
     for (diags.items) |d| {
         try std.testing.expect(!std.mem.eql(u8, d.rule_id, "c/local-macro-undef"));
     }
+}
+
+test "c/uninitialized-local allows stack array buffers" {
+    const src =
+        "#include <stdint.h>\n" ++
+        "static void foo(void) {\n" ++
+        "\tuint8_t buf[8192];\n" ++
+        "\t(void)buf;\n" ++
+        "}\n";
+    var diags = try checkSource(src, "test.c");
+    defer diags.deinit(std.testing.allocator);
+    for (diags.items) |d| {
+        try std.testing.expect(!std.mem.eql(u8, d.rule_id, "c/uninitialized-local"));
+    }
+}
+
+test "c/explicit-int-types allows unsigned char and printf casts" {
+    const src =
+        "#include <stdio.h>\n" ++
+        "#include <stdint.h>\n" ++
+        "static void foo(uint64_t val) {\n" ++
+        "\tunsigned char buf[16] = {0};\n" ++
+        "\tprintf(\"%lu %zu\", (unsigned long)val, sizeof(buf));\n" ++
+        "}\n";
+    var diags = try checkSource(src, "test.c");
+    defer diags.deinit(std.testing.allocator);
+    for (diags.items) |d| {
+        try std.testing.expect(!std.mem.eql(u8, d.rule_id, "c/explicit-int-types"));
+    }
+}
+
+test "c/explicit-int-types still flags non-printf casts" {
+    const src =
+        "#include <stdint.h>\n" ++
+        "static uint64_t foo(uint64_t val) {\n" ++
+        "\treturn (unsigned long)val;\n" ++
+        "}\n";
+    var diags = try checkSource(src, "test.c");
+    defer diags.deinit(std.testing.allocator);
+    var found = false;
+    for (diags.items) |d| {
+        if (std.mem.eql(u8, d.rule_id, "c/explicit-int-types")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "c/internal-linkage skips symbols declared in headers" {
+    const header_src =
+        "#ifndef UC_H\n" ++
+        "#define UC_H\n" ++
+        "typedef struct uc uc_t;\n" ++
+        "uc_t *uc_new(void);\n" ++
+        "void uc_free(uc_t *uc);\n" ++
+        "#endif\n";
+    const c_src =
+        "#include \"uc.h\"\n" ++
+        "uc_t *uc_new(void) { return 0; }\n" ++
+        "void uc_free(uc_t *uc) { (void)uc; }\n" ++
+        "void helper_internal(void) {}\n";
+
+    const parser = ts.c.ts_parser_new();
+    defer ts.c.ts_parser_delete(parser);
+    _ = ts.c.ts_parser_set_language(parser, ts.tree_sitter_c());
+
+    var header_syms = std.StringHashMap(void).init(std.testing.allocator);
+    defer {
+        var it = header_syms.keyIterator();
+        while (it.next()) |k| std.testing.allocator.free(k.*);
+        header_syms.deinit();
+    }
+
+    const h_tree = ts.c.ts_parser_parse_string(
+        parser,
+        null,
+        header_src.ptr,
+        @intCast(header_src.len),
+    );
+    defer ts.c.ts_tree_delete(h_tree);
+    try collectHeaderSymbols(std.testing.allocator, h_tree.?, header_src, &header_syms);
+
+    const c_tree = ts.c.ts_parser_parse_string(
+        parser,
+        null,
+        c_src.ptr,
+        @intCast(c_src.len),
+    );
+    defer ts.c.ts_tree_delete(c_tree);
+
+    var diags = std.ArrayList(diagnostic.Diagnostic).empty;
+    defer diags.deinit(std.testing.allocator);
+    var ctx = Context{
+        .allocator = std.testing.allocator,
+        .file_path = "uc.c",
+        .source = c_src,
+        .diagnostics = &diags,
+        .c_header_symbols = &header_syms,
+    };
+    try run(&ctx, ts.c.ts_tree_root_node(c_tree.?));
+
+    var linkage_count: usize = 0;
+    for (diags.items) |d| {
+        if (std.mem.eql(u8, d.rule_id, "c/internal-linkage")) {
+            linkage_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), linkage_count);
 }
 
 test "deep nesting does not overflow stack" {

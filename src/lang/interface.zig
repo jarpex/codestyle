@@ -21,6 +21,8 @@ pub const Context = struct {
     io: ?std.Io = null,
     /// Per-project exceptions loaded from `.codestyle.json`.
     allow: config.Allowlists = config.default_allowlists,
+    /// Public symbols declared in C header files across the project.
+    c_header_symbols: ?*const std.StringHashMap(void) = null,
     /// Set by `run_raw_checks` when an input fuse aborts further analysis.
     aborted: bool = false,
 
