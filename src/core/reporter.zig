@@ -67,17 +67,16 @@ pub fn extractLine(source: []const u8, target_line_1based: usize) []const u8 {
     var start_idx: usize = 0;
     var i: usize = 0;
     while (i < source.len) : (i += 1) {
-        if (source[i] == '\n') {
-            if (cur_line == target_line_1based) {
-                var line = source[start_idx..i];
-                if (line.len > 0 and line[line.len - 1] == '\r') {
-                    line = line[0 .. line.len - 1];
-                }
-                return line;
+        if (source[i] != '\n') continue;
+        if (cur_line == target_line_1based) {
+            var line = source[start_idx..i];
+            if (line.len > 0 and line[line.len - 1] == '\r') {
+                line = line[0 .. line.len - 1];
             }
-            cur_line += 1;
-            start_idx = i + 1;
+            return line;
         }
+        cur_line += 1;
+        start_idx = i + 1;
     }
     if (cur_line == target_line_1based and start_idx <= source.len) {
         var line = source[start_idx..];

@@ -115,7 +115,7 @@ pub fn run(
     var has_errors = false;
 
     for (file_paths.items) |file_path| {
-        const ext = std.fs.path.extension(file_path);
+        const ext = std.Io.Dir.path.extension(file_path);
         const lang = registry.findByExtension(ext) orelse continue;
 
         _ = file_arena.reset(.retain_capacity);
@@ -150,49 +150,15 @@ pub fn run(
         };
 
         if (!ctx.aborted) {
-            if (lang.get_grammar) |grammar_fn| {
-                if (parser == null) {
-                    parser = ts.c.ts_parser_new();
-                }
-                const p = parser.?;
-                const grammar = grammar_fn() orelse {
-                    try err_out.print(
-                        "codestyle: grammar initialization failed for '{s}'\n",
-                        .{file_path},
-                    );
-                    try err_out.flush();
-                    return 2;
-                };
-                _ = ts.c.ts_parser_set_language(p, grammar);
-                const tree = ts.c.ts_parser_parse_string(
-                    p,
-                    null,
-                    source.ptr,
-                    @intCast(source.len),
-                );
-                if (tree != null) {
-                    defer ts.c.ts_tree_delete(tree);
-                    lang.run_ast_checks(&ctx, tree) catch |err| {
-                        if (err == error.OutOfMemory) return error.OutOfMemory;
-                        try err_out.print(
-                            "codestyle: rule pass failed on '{s}': {t}\n",
-                            .{ file_path, err },
-                        );
-                        try err_out.flush();
-                        return 2;
-                    };
-                }
-            } else {
-                lang.run_ast_checks(&ctx, null) catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    try err_out.print(
-                        "codestyle: rule pass failed on '{s}': {t}\n",
-                        .{ file_path, err },
-                    );
-                    try err_out.flush();
-                    return 2;
-                };
-            }
+            const ast_ok = try runAstPass(
+                lang,
+                &ctx,
+                &parser,
+                err_out,
+                file_path,
+                source,
+            );
+            if (!ast_ok) return 2;
         }
 
         sortDiagnostics(diags.items);
@@ -202,24 +168,16 @@ pub fn run(
         }
 
         if (options.format == .clippy) {
-            for (diags.items) |d| {
-                if (d.severity == .off) continue;
-                if (d.suppressed) {
-                    const seen = suppressed_rule_counts.get(d.rule_id) orelse 0;
-                    try suppressed_rule_counts.put(d.rule_id, seen + 1);
-                    suppressed_total += 1;
-                    continue;
-                }
-                try reporter.renderClippyDiagnostic(
-                    arena_allocator,
-                    out,
-                    d,
-                    file_path,
-                    source,
-                    options.no_color,
-                );
-            }
-            try out.flush();
+            try emitClippyFile(
+                arena_allocator,
+                out,
+                diags.items,
+                file_path,
+                source,
+                options.no_color,
+                &suppressed_rule_counts,
+                &suppressed_total,
+            );
         } else {
             // Deep-clone into the GPA: the arena dies with this iteration.
             const cloned_diags = try gpa.alloc(diagnostic.Diagnostic, diags.items.len);
@@ -290,25 +248,94 @@ fn collectFiles(
         return;
     }
 
-    if (stat_res.kind == .directory) {
-        var dir = try std.Io.Dir.cwd().openDir(io, target_path, .{ .iterate = true });
-        defer dir.close(io);
+    if (stat_res.kind != .directory) return;
 
-        var walker = try dir.walk(gpa);
-        defer walker.deinit();
+    var dir = try std.Io.Dir.cwd().openDir(io, target_path, .{ .iterate = true });
+    defer dir.close(io);
 
-        while (try walker.next(io)) |entry| {
-            if (entry.kind == .directory) {
-                if (shouldSkipDir(entry.basename)) {
-                    walker.leave(io);
-                }
-                continue;
-            }
-            if (entry.kind == .file) {
-                const full_sub_path = try std.fs.path.join(gpa, &.{ target_path, entry.path });
-                errdefer gpa.free(full_sub_path);
-                try file_paths.append(gpa, full_sub_path);
-            }
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            if (shouldSkipDir(entry.basename)) walker.leave(io);
+            continue;
         }
+        if (entry.kind != .file) continue;
+        const full_sub_path = try std.Io.Dir.path.join(
+            gpa,
+            &.{ target_path, entry.path },
+        );
+        errdefer gpa.free(full_sub_path);
+        try file_paths.append(gpa, full_sub_path);
     }
+}
+
+fn runAstPass(
+    lang: interface.Language,
+    ctx: *Context,
+    parser: *?*ts.c.TSParser,
+    err_out: *std.Io.Writer,
+    file_path: []const u8,
+    source: []const u8,
+) !bool {
+    const grammar_fn = lang.get_grammar orelse {
+        lang.run_ast_checks(ctx, null) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try err_out.print("codestyle: rule pass failed on '{s}': {t}\n", .{ file_path, err });
+            try err_out.flush();
+            return false;
+        };
+        return true;
+    };
+
+    if (parser.* == null) parser.* = ts.c.ts_parser_new();
+    const p = parser.*.?;
+    const grammar = grammar_fn() orelse {
+        try err_out.print("codestyle: grammar initialization failed for '{s}'\n", .{file_path});
+        try err_out.flush();
+        return false;
+    };
+    _ = ts.c.ts_parser_set_language(p, grammar);
+    const tree = ts.c.ts_parser_parse_string(p, null, source.ptr, @intCast(source.len));
+    if (tree == null) return true;
+    defer ts.c.ts_tree_delete(tree);
+
+    lang.run_ast_checks(ctx, tree) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        try err_out.print("codestyle: rule pass failed on '{s}': {t}\n", .{ file_path, err });
+        try err_out.flush();
+        return false;
+    };
+    return true;
+}
+
+fn emitClippyFile(
+    arena_allocator: std.mem.Allocator,
+    out: *std.Io.Writer,
+    diags: []const diagnostic.Diagnostic,
+    file_path: []const u8,
+    source: []const u8,
+    no_color: bool,
+    suppressed_rule_counts: *std.StringHashMap(usize),
+    suppressed_total: *usize,
+) !void {
+    for (diags) |d| {
+        if (d.severity == .off) continue;
+        if (d.suppressed) {
+            const seen = suppressed_rule_counts.get(d.rule_id) orelse 0;
+            try suppressed_rule_counts.put(d.rule_id, seen + 1);
+            suppressed_total.* += 1;
+            continue;
+        }
+        try reporter.renderClippyDiagnostic(
+            arena_allocator,
+            out,
+            d,
+            file_path,
+            source,
+            no_color,
+        );
+    }
+    try out.flush();
 }

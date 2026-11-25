@@ -92,39 +92,35 @@ pub fn parse(
             continue;
         }
 
-        if (own_line) |body| {
-            if (takeMarker(file_marker, body)) |args| {
-                if (seen_code) {
-                    try rejected.append(allocator, .{
-                        .line = line_no,
-                        .reason = .misplaced_file_directive,
-                    });
-                    continue;
-                }
-                try addEntries(allocator, &map, args, .file, 0, rejected, line_no);
-                continue;
-            }
-            if (takeMarker(line_marker, body)) |args| {
-                try addEntries(allocator, &map, args, .line, line_no + 1, rejected, line_no);
-                continue;
+        if (own_line == null) {
+            // The code line keeps seen_code set, then its trailing comment is read.
+            seen_code = true;
+            const tbody = trailing orelse continue;
+            if (takeMarker(file_marker, tbody) != null) {
+                try rejected.append(allocator, .{
+                    .line = line_no,
+                    .reason = .misplaced_file_directive,
+                });
+            } else if (takeMarker(line_marker, tbody)) |args| {
+                try addEntries(allocator, &map, args, .line, line_no, rejected, line_no);
             }
             continue;
         }
 
-        // The code line keeps seen_code set, then its trailing comment is read.
-        seen_code = true;
-        if (trailing) |body| {
-            if (takeMarker(file_marker, body) != null) {
+        const body = own_line.?;
+        if (takeMarker(file_marker, body)) |args| {
+            if (seen_code) {
                 try rejected.append(allocator, .{
                     .line = line_no,
                     .reason = .misplaced_file_directive,
                 });
                 continue;
             }
-            if (takeMarker(line_marker, body)) |args| {
-                try addEntries(allocator, &map, args, .line, line_no, rejected, line_no);
-                continue;
-            }
+            try addEntries(allocator, &map, args, .file, 0, rejected, line_no);
+            continue;
+        }
+        if (takeMarker(line_marker, body)) |args| {
+            try addEntries(allocator, &map, args, .line, line_no + 1, rejected, line_no);
         }
     }
 
@@ -149,13 +145,26 @@ fn directiveBody(trimmed: []const u8, options: Options) ?[]const u8 {
     return null;
 }
 
-/// Trailing comment of a code line: the text after the first `//` that is
-/// not inside a string literal. A line with no trailing comment returns null.
+/// Trailing comment of a code line: the text after the first `//` or
+/// `options.block_open` outside string literals.
 fn trailingDirectiveBody(trimmed: []const u8, options: Options) ?[]const u8 {
-    _ = options;
-    const idx = commentStart(trimmed) orelse return null;
-    if (idx == 0) return null;
-    return stripCommentMarker(trimmed[idx + 2 ..]);
+    const line_idx = commentStart(trimmed, "//");
+    const block_idx = if (options.block_open.len > 0)
+        commentStart(trimmed, options.block_open)
+    else
+        null;
+
+    if (block_idx) |bi| {
+        if (line_idx == null or bi < line_idx.?) {
+            if (bi == 0) return null;
+            const after = trimmed[bi + options.block_open.len ..];
+            const end_rel = std.mem.indexOf(u8, after, options.block_close) orelse return null;
+            return std.mem.trim(u8, after[0..end_rel], " \t");
+        }
+    }
+    const li = line_idx orelse return null;
+    if (li == 0) return null;
+    return stripCommentMarker(trimmed[li + 2 ..]);
 }
 
 fn stripCommentMarker(body: []const u8) []const u8 {
@@ -164,18 +173,30 @@ fn stripCommentMarker(body: []const u8) []const u8 {
     return text;
 }
 
-/// Byte index of the `//` that opens a comment, skipping string literals.
-fn commentStart(line: []const u8) ?usize {
+/// Byte index of `marker` outside string literals (handling `\"` and `\\`).
+fn commentStart(line: []const u8, marker: []const u8) ?usize {
+    if (marker.len == 0) return null;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         if (line[i] == '"') {
-            i += 1;
-            while (i < line.len and line[i] != '"') : (i += 1) {}
+            i = skipStringLiteral(line, i);
             continue;
         }
-        if (line[i] == '/' and i + 1 < line.len and line[i + 1] == '/') return i;
+        if (std.mem.startsWith(u8, line[i..], marker)) return i;
     }
     return null;
+}
+
+fn skipStringLiteral(line: []const u8, open_quote: usize) usize {
+    var i = open_quote + 1;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == '\\' and i + 1 < line.len) {
+            i += 1;
+            continue;
+        }
+        if (line[i] == '"') return i;
+    }
+    return line.len - 1;
 }
 
 /// Match `marker` at the head of `text` and return what follows it.
@@ -215,7 +236,7 @@ fn addEntries(
             try rejected.append(allocator, .{ .line = line_no, .reason = .fuse_not_suppressible });
             continue;
         }
-        if (kind == .line and table.isHeuristic(id) and !has_reason) {
+        if (table.isHeuristic(id) and !has_reason) {
             const entry = Rejected{ .line = line_no, .reason = .heuristic_without_reason };
             try rejected.append(allocator, entry);
             continue;
@@ -351,4 +372,29 @@ test "fuses cannot be suppressed" {
 
     try std.testing.expect(!r.map.isSuppressed("zig/invalid-nul-byte", 1));
     try std.testing.expectEqual(Reason.fuse_not_suppressible, r.rejected.items[0].reason);
+}
+
+test "escaped quotes in string, C trailing block directive, and file heuristic reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zig_src = "const s = \"a \\\" // b\"; // codestyle:ignore zig/var-naming\n";
+    var rz = try parseTest(a, zig_src, .{});
+    defer rz.map.deinit(a);
+    defer rz.rejected.deinit(a);
+    try std.testing.expect(rz.map.isSuppressed("zig/var-naming", 1));
+
+    const c_src = "int x = 1; /* codestyle:ignore c/explicit-int-types */\n";
+    var rc = try parseTest(a, c_src, .{ .block_open = "/*", .block_close = "*/" });
+    defer rc.map.deinit(a);
+    defer rc.rejected.deinit(a);
+    try std.testing.expect(rc.map.isSuppressed("c/explicit-int-types", 1));
+
+    const file_src = "//! codestyle:ignore-file zig/checked-casts\n";
+    var rf = try parseTest(a, file_src, .{});
+    defer rf.map.deinit(a);
+    defer rf.rejected.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), rf.rejected.items.len);
+    try std.testing.expectEqual(Reason.heuristic_without_reason, rf.rejected.items[0].reason);
 }

@@ -11,6 +11,7 @@ pub const RuleDef = struct {
     id: []const u8,
     default_severity: diagnostic.Severity,
     strict_severity: ?diagnostic.Severity = null,
+    migration_severity: ?diagnostic.Severity = null,
     description: []const u8,
 };
 
@@ -123,7 +124,8 @@ pub const rules = [_]RuleDef{
     },
     .{
         .id = "c/declarations-at-top",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Local variable must be declared at the very top of the function body",
     },
     .{
@@ -133,23 +135,27 @@ pub const rules = [_]RuleDef{
     },
     .{
         .id = "c/loop-counter-scope",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Loop counter assigned instead of declared inside the for header",
     },
     .{
         .id = "c/const-lookup-tables",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Initialized lookup array or table is not marked 'const'",
     },
     .{
         .id = "c/internal-linkage",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Global symbol lacks 'static' internal linkage specifier",
     },
     // C99 AST rules: security and system calls
     .{
         .id = "c/infinite-loop-for",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Use 'for (;;)' for infinite loops instead of 'while (1)'",
     },
     .{
@@ -192,18 +198,21 @@ pub const rules = [_]RuleDef{
     // C99 AST rules: arithmetic and macros
     .{
         .id = "c/bitwise-pow2",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Multiplication or division by a constant power of two",
     },
     .{
         .id = "c/local-macro-undef",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Function-local macro is not undefined after use",
     },
     // C99 AST rules: complexity
     .{
         .id = "complexity/max-nesting-depth",
-        .default_severity = .err,
+        .default_severity = .warning,
+        .strict_severity = .err,
         .description = "Control flow nesting depth exceeds maximum limit of 3",
     },
 
@@ -277,10 +286,16 @@ pub const rules = [_]RuleDef{
         .description = "Runtime safety checks disabled with @setRuntimeSafety(false)",
     },
     .{
-        .id = "zig/no-panic-unreachable",
+        .id = "zig/no-panic-in-lib",
+        .default_severity = .err,
+        .strict_severity = .err,
+        .description = "Call to @panic() in library code",
+    },
+    .{
+        .id = "zig/no-bare-unreachable",
         .default_severity = .warning,
         .strict_severity = .err,
-        .description = "Call to @panic() or bare 'unreachable' in library code",
+        .description = "Bare 'unreachable' in library code",
     },
     .{
         .id = "zig/no-anyerror",
@@ -333,12 +348,12 @@ pub const rules = [_]RuleDef{
     .{
         .id = "zig/assert-no-side-effects",
         .default_severity = .warning,
-        .strict_severity = .warning,
+        .strict_severity = .err,
         .description = "Assertion expression has a side effect",
     },
     .{
         .id = "zig/no-undefined-struct",
-        .default_severity = .note,
+        .default_severity = .off,
         .strict_severity = .note,
         .description = "Value initialised with 'undefined'",
     },
@@ -352,7 +367,7 @@ pub const rules = [_]RuleDef{
     // Zig memory rules (src/lang/zig/rules/mem.zig)
     .{
         .id = "zig/unbounded-read",
-        .default_severity = .warning,
+        .default_severity = .err,
         .strict_severity = .err,
         .description = "Stream read allocation without a byte bound",
     },
@@ -447,7 +462,7 @@ pub const rules = [_]RuleDef{
     .{
         .id = "zig/secure-zero",
         .default_severity = .warning,
-        .strict_severity = .warning,
+        .strict_severity = .err,
         .description = "Secret buffer cleared with a plain @memset or zero literal",
     },
     .{
@@ -461,7 +476,7 @@ pub const rules = [_]RuleDef{
     .{
         .id = "zig/block-depth",
         .default_severity = .warning,
-        .strict_severity = .warning,
+        .strict_severity = .err,
         .description = "Control flow block nesting depth exceeds maximum limit of 3",
     },
 
@@ -486,7 +501,7 @@ pub const rules = [_]RuleDef{
     },
     .{
         .id = "zig/zon-explicit-paths",
-        .default_severity = .warning,
+        .default_severity = .err,
         .strict_severity = .err,
         .description = "build.zig.zon .paths packages the repository root",
     },
@@ -494,158 +509,184 @@ pub const rules = [_]RuleDef{
     // Zig migration rules (src/lang/zig/rules/migration.zig)
     .{
         .id = "zig/deprecated-gpa",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "GeneralPurposeAllocator used instead of DebugAllocator",
     },
     .{
         .id = "zig/legacy-std-io",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "Legacy std.io stream or generic reader/writer used",
     },
     .{
         .id = "zig/unmanaged-arraylist",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "Stateful ArrayList.init(allocator) pattern used",
     },
     .{
         .id = "zig/renamed-read-file-alloc",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "readFileAlloc called with the pre-0.16 argument order",
     },
     .{
         .id = "zig/renamed-fs-path",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.fs.path moved to std.Io.Dir.path in 0.16",
     },
     .{
         .id = "zig/renamed-fs-cwd",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.fs.cwd moved to std.Io.Dir.cwd in 0.16",
     },
     .{
         .id = "zig/renamed-process-child",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "process.Child.init and spawn replaced by process.spawn",
     },
     .{
         .id = "zig/renamed-std-time",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.time moved under Io.Timestamp and Io.Duration",
     },
     .{
         .id = "zig/removed-std-once",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.once is removed in 0.16",
     },
     .{
         .id = "zig/removed-thread-pool",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.Thread.Pool replaced by Io.Group in 0.16",
     },
     .{
         .id = "zig/removed-segmented-list",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.SegmentedList is removed in 0.16",
     },
     .{
         .id = "zig/removed-thread-mutex-recursive",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.Thread.Mutex.Recursive is removed in 0.16",
     },
     .{
         .id = "zig/removed-std-io-null-writer",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.io.null_writer is removed in 0.16",
     },
     .{
         .id = "zig/removed-meta-decl-list",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "std.meta.declList is removed in 0.16",
     },
     .{
         .id = "zig/stream-too-long",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "error.FileTooBig replaced by error.StreamTooLong in 0.16",
     },
     .{
         .id = "zig/dir-not-empty",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "Dir.rename returns error.DirNotEmpty instead of error.PathAlreadyExists",
     },
     .{
         .id = "zig/atime-optional",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "stat.atime is optional (?Timestamp) in 0.16",
     },
     .{
         .id = "zig/math-sign-type",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "std.math.sign returns narrowed integer type in 0.16",
     },
     .{
         .id = "zig/memory-map-errors",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "File.MemoryMap WASI error set changed in 0.16",
     },
     .{
         .id = "zig/clock-error-sets",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "Clock error.ClockUnsupported removed in 0.16",
     },
     .{
         .id = "zig/component-iterator-infallible",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "componentIterator is infallible in 0.16",
     },
     .{
         .id = "zig/tar-traversal-sanitize",
-        .default_severity = .warning,
-        .strict_severity = .warning,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .warning,
         .description = "tar.extract automatically sanitizes path traversal in 0.16",
     },
     .{
         .id = "zig/removed-dupe-z",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "Allocator.dupeZ is removed in 0.17",
     },
     .{
         .id = "zig/removed-errdefer-capture",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "errdefer payload capture is removed in 0.17",
     },
     .{
         .id = "zig/removed-array-mul",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "Array multiplication operator ** is removed in 0.17",
     },
     .{
         .id = "zig/removed-build-args",
-        .default_severity = .note,
-        .strict_severity = .note,
+        .default_severity = .off,
+        .strict_severity = .off,
+        .migration_severity = .note,
         .description = "Build.args is removed in 0.17",
     },
 
@@ -681,8 +722,9 @@ pub fn findRule(rule_id: []const u8) ?RuleDef {
 /// id so there is no silent unknown-id default anywhere in the codebase.
 pub fn severityOf(r: RuleDef, profile: Profile) diagnostic.Severity {
     return switch (profile) {
-        .default, .migration => r.default_severity,
+        .default => r.default_severity,
         .strict => r.strict_severity orelse r.default_severity,
+        .migration => r.migration_severity orelse r.default_severity,
     };
 }
 
@@ -712,6 +754,8 @@ pub fn isFuse(rule_id: []const u8) bool {
 /// requires a reason, because the finding may be a false positive.
 pub fn isHeuristic(rule_id: []const u8) bool {
     const heuristic = [_][]const u8{
+        "security/no-plain-memset-scrub",
+        "zig/no-post-overflow-check",
         "zig/checked-casts",
         "zig/assert-no-side-effects",
         "zig/no-undefined-struct",
@@ -722,7 +766,9 @@ pub fn isHeuristic(rule_id: []const u8) bool {
         "zig/handled-cancel",
         "zig/concurrency-fallback",
         "zig/no-recursion",
+        "zig/crypto-random",
         "zig/secure-zero",
+        "zig/timing-safe-eql",
     };
     for (heuristic) |id| {
         if (std.mem.eql(u8, id, rule_id)) return true;
@@ -743,8 +789,9 @@ test "findRule resolves registered rules" {
 test "severityOf mirrors the registered severity in every profile" {
     for (rules) |r| {
         const expected_strict = r.strict_severity orelse r.default_severity;
+        const expected_migration = r.migration_severity orelse r.default_severity;
         try std.testing.expectEqual(r.default_severity, severityOf(r, .default));
-        try std.testing.expectEqual(r.default_severity, severityOf(r, .migration));
+        try std.testing.expectEqual(expected_migration, severityOf(r, .migration));
         try std.testing.expectEqual(expected_strict, severityOf(r, .strict));
     }
 }
@@ -788,7 +835,8 @@ test "safety rules fail under every profile" {
         "c/no-vla",
         "security/safe-realloc",
         "security/banned-functions",
-        "complexity/max-nesting-depth",
+        "c/explicit-int-types",
+        "c/uninitialized-local",
     };
     for (err_always) |id| {
         const r = findRule(id) orelse return error.TestUnexpectedResult;
@@ -797,17 +845,21 @@ test "safety rules fail under every profile" {
     }
 }
 
-test "migration notes stay notes and never fail a build" {
+test "migration notes stay off in default and strict, active in migration" {
     for (rules) |r| {
-        if (r.default_severity != .note) continue;
-        try std.testing.expectEqual(diagnostic.Severity.note, severityOf(r, .strict));
+        const mig = r.migration_severity orelse continue;
+        try std.testing.expectEqual(diagnostic.Severity.off, severityOf(r, .default));
+        try std.testing.expectEqual(diagnostic.Severity.off, severityOf(r, .strict));
+        try std.testing.expectEqual(mig, severityOf(r, .migration));
     }
     const gpa = findRule("zig/deprecated-gpa") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(diagnostic.Severity.note, severityOf(gpa, .default));
+    try std.testing.expectEqual(diagnostic.Severity.off, severityOf(gpa, .default));
+    try std.testing.expectEqual(diagnostic.Severity.note, severityOf(gpa, .migration));
 }
 
 test "off rules stay off until strict promotes them" {
     for (rules) |r| {
+        if (r.migration_severity != null) continue;
         if (r.default_severity != .off) continue;
         try std.testing.expectEqual(diagnostic.Severity.off, severityOf(r, .migration));
     }

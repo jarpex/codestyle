@@ -3,13 +3,13 @@ const std = @import("std");
 /// Path patterns that opt out of one rule. A pattern matches a file path when
 /// it equals the path, ends with the pattern, or contains it.
 pub const Allowlists = struct {
-    /// Modules that own the C ABI: unchecked casts and `@cImport` are allowed
-    /// there and nowhere else. The key keeps the documented name.
-    unsafe_casts: []const []const u8 = &.{"src/core/ts.zig"},
+    /// Modules that own the C ABI: unchecked casts, `extern "c"`, and
+    /// `@cImport` are allowed there and nowhere else.
+    unsafe_casts: []const []const u8 = &.{},
     /// Files allowed to use `@"..."` identifiers.
-    raw_identifiers: []const []const u8 = &.{ "src/core/ts.zig", "src/lang/c/ast_rules.zig" },
+    raw_identifiers: []const []const u8 = &.{},
     /// Files allowed to call `std.posix` and `std.os.linux` directly.
-    direct_posix: []const []const u8 = &.{"src/core/runner.zig"},
+    direct_posix: []const []const u8 = &.{},
     /// Function names exempt from `zig/fn-naming`, on top of `main` and
     /// C-ABI functions. Entries are exact names, not paths.
     fn_naming: []const []const u8 = &.{},
@@ -102,12 +102,12 @@ fn adopt(
     return out;
 }
 
-test "embedded defaults cover the FFI boundary module" {
+test "embedded defaults are empty" {
     const a = default_allowlists;
-    try std.testing.expect(a.allowsFfi("src/core/ts.zig"));
-    try std.testing.expect(a.allowsRawIdentifier("src/core/ts.zig"));
-    try std.testing.expect(!a.allowsFfi("src/main.zig"));
-    try std.testing.expect(!a.allowsDirectPosix("src/lang/c/ast_rules.zig"));
+    try std.testing.expect(!a.allowsFfi("src/core/ts.zig"));
+    try std.testing.expect(!a.allowsRawIdentifier("src/core/ts.zig"));
+    try std.testing.expect(!a.allowsDirectPosix("src/core/runner.zig"));
+    try std.testing.expectEqual(@as(usize, 0), a.fn_naming.len);
 }
 
 test "pattern match accepts a full path, a suffix and a substring" {
@@ -117,12 +117,14 @@ test "pattern match accepts a full path, a suffix and a substring" {
     try std.testing.expect(!Allowlists.matches(&list, "src/core/other.zig"));
 }
 
-test "a missing config yields the embedded defaults" {
+test "a missing config yields empty defaults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const loaded = try load(a, std.testing.io, "/nonexistent-codestyle-root");
-    try std.testing.expect(loaded.allowsFfi("src/core/ts.zig"));
-    try std.testing.expectEqual(default_allowlists.raw_identifiers.len, loaded.raw_identifiers.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.unsafe_casts.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.raw_identifiers.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.direct_posix.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.fn_naming.len);
 }
