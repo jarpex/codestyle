@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 
 static const uint8_t lookup_table[4] = { 1, 2, 3, 4 };
 
@@ -14,9 +15,9 @@ static int32_t process_data(int32_t fd) {
 
 	for (size_t i = 0; i < 4; i++) {
 		if (i > 2) {
-			while (n < 0) {
+			do {
 				n = read(fd, buf, sizeof(buf));
-			}
+			} while (n == -1 && errno == EINTR);
 		}
 	}
 

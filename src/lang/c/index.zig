@@ -23,7 +23,8 @@ fn runRawChecks(ctx: *Context) interface.CheckError!void {
     defer rejected.deinit(ctx.allocator);
     // The map lives in the per-file arena: the runner resets it after this
     // file, so a stack local would dangle for the AST pass.
-    const map = try ctx.allocator.create(suppression.Map);
+    const arena = ctx.allocator;
+    const map = try arena.create(suppression.Map);
     map.* = try suppression.parse(ctx.allocator, ctx.source, .{
         .block_open = "/*",
         .block_close = "*/",

@@ -62,36 +62,29 @@ fn isConstantSize(allocator: std.mem.Allocator, node: ts.c.TSNode, source: []con
     return true;
 }
 
-fn hasStorageClass(node: ts.c.TSNode, source: []const u8, class_name: []const u8) bool {
+fn hasChildOfTypeAndText(
+    node: ts.c.TSNode,
+    source: []const u8,
+    node_type: []const u8,
+    expected: []const u8,
+) bool {
     const count = ts.childCount(node);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const ch = ts.child(node, i);
-        if (!ts.isNull(ch)) {
-            const t = ts.getNodeType(ch);
-            if (std.mem.eql(u8, t, "storage_class_specifier")) {
-                const txt = ts.getNodeText(ch, source);
-                if (std.mem.eql(u8, txt, class_name)) return true;
-            }
-        }
+        if (ts.isNull(ch)) continue;
+        if (!std.mem.eql(u8, ts.getNodeType(ch), node_type)) continue;
+        if (std.mem.eql(u8, ts.getNodeText(ch, source), expected)) return true;
     }
     return false;
 }
 
+fn hasStorageClass(node: ts.c.TSNode, source: []const u8, class_name: []const u8) bool {
+    return hasChildOfTypeAndText(node, source, "storage_class_specifier", class_name);
+}
+
 fn hasTypeQualifier(node: ts.c.TSNode, source: []const u8, qual_name: []const u8) bool {
-    const count = ts.childCount(node);
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const ch = ts.child(node, i);
-        if (!ts.isNull(ch)) {
-            const t = ts.getNodeType(ch);
-            if (std.mem.eql(u8, t, "type_qualifier")) {
-                const txt = ts.getNodeText(ch, source);
-                if (std.mem.eql(u8, txt, qual_name)) return true;
-            }
-        }
-    }
-    return false;
+    return hasChildOfTypeAndText(node, source, "type_qualifier", qual_name);
 }
 
 fn isPowerOfTwo(val: u64) bool {
@@ -191,17 +184,34 @@ fn hasSideEffects(root: ts.c.TSNode, source: []const u8) bool {
     }
 }
 
-fn isInsideLoop(node: ts.c.TSNode) bool {
+fn enclosingLoop(node: ts.c.TSNode) ?ts.c.TSNode {
     var maybe_parent = ts.parent(node);
     while (maybe_parent) |curr| {
         const t = ts.getNodeType(curr);
         if (std.mem.eql(u8, t, "for_statement") or
             std.mem.eql(u8, t, "while_statement") or
-            std.mem.eql(u8, t, "do_statement")) return true;
+            std.mem.eql(u8, t, "do_statement")) return curr;
         if (std.mem.eql(u8, t, "function_definition")) break;
         maybe_parent = ts.parent(curr);
     }
-    return false;
+    return null;
+}
+
+fn subtreeHasIdent(root: ts.c.TSNode, source: []const u8, wanted: []const u8) bool {
+    var cursor = ts.c.ts_tree_cursor_new(root);
+    defer ts.c.ts_tree_cursor_delete(&cursor);
+    while (true) {
+        const node = ts.c.ts_tree_cursor_current_node(&cursor);
+        if (std.mem.eql(u8, ts.getNodeType(node), "identifier") and
+            std.mem.eql(u8, ts.getNodeText(node, source), wanted))
+        {
+            return true;
+        }
+        if (ts.c.ts_tree_cursor_goto_first_child(&cursor)) continue;
+        while (!ts.c.ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts.c.ts_tree_cursor_goto_parent(&cursor)) return false;
+        }
+    }
 }
 
 fn subtreeHasNodeType(root: ts.c.TSNode, type_name: []const u8) bool {
@@ -217,6 +227,25 @@ fn subtreeHasNodeType(root: ts.c.TSNode, type_name: []const u8) bool {
     }
 }
 
+fn isMacroDef(ntype: []const u8) bool {
+    return std.mem.eql(u8, ntype, "preproc_def") or
+        std.mem.eql(u8, ntype, "preproc_function_def");
+}
+
+fn isMatchingUndef(node: ts.c.TSNode, source: []const u8, name: []const u8) bool {
+    if (!std.mem.eql(u8, ts.getNodeType(node), "preproc_call")) return false;
+    const directive = ts.childByField(node, "directive");
+    if (ts.isNull(directive)) return false;
+    const dtext = ts.getNodeText(directive, source);
+    if (!std.mem.startsWith(u8, dtext, "#")) return false;
+    const word = std.mem.trimStart(u8, dtext[1..], " \t");
+    if (!std.mem.eql(u8, word, "undef")) return false;
+    const arg = ts.childByField(node, "argument");
+    if (ts.isNull(arg)) return false;
+    const atext = std.mem.trim(u8, ts.getNodeText(arg, source), " \t\r");
+    return std.mem.eql(u8, atext, name);
+}
+
 fn checkLocalMacroUndef(ctx: *Context, root: ts.c.TSNode) interface.CheckError!void {
     const count = ts.namedChildCount(root);
     var seen_function = false;
@@ -226,9 +255,10 @@ fn checkLocalMacroUndef(ctx: *Context, root: ts.c.TSNode) interface.CheckError!v
         const t = ts.getNodeType(item);
         if (std.mem.eql(u8, t, "function_definition")) {
             seen_function = true;
+            try checkFnBodyMacroUndef(ctx, item, root, i + 1);
             continue;
         }
-        if (!seen_function or !std.mem.eql(u8, t, "preproc_def")) continue;
+        if (!seen_function or !isMacroDef(t)) continue;
 
         const name_node = ts.childByField(item, "name");
         if (ts.isNull(name_node)) continue;
@@ -237,18 +267,7 @@ fn checkLocalMacroUndef(ctx: *Context, root: ts.c.TSNode) interface.CheckError!v
         var undef_found = false;
         var j: u32 = i + 1;
         while (j < count) : (j += 1) {
-            const sib = ts.namedChild(root, j);
-            if (!std.mem.eql(u8, ts.getNodeType(sib), "preproc_call")) continue;
-            const directive = ts.childByField(sib, "directive");
-            if (ts.isNull(directive)) continue;
-            const dtext = ts.getNodeText(directive, ctx.source);
-            if (!std.mem.startsWith(u8, dtext, "#")) continue;
-            const word = std.mem.trimStart(u8, dtext[1..], " \t");
-            if (!std.mem.eql(u8, word, "undef")) continue;
-            const arg = ts.childByField(sib, "argument");
-            if (ts.isNull(arg)) continue;
-            const atext = std.mem.trim(u8, ts.getNodeText(arg, ctx.source), " \t\r");
-            if (std.mem.eql(u8, atext, name)) {
+            if (isMatchingUndef(ts.namedChild(root, j), ctx.source, name)) {
                 undef_found = true;
                 break;
             }
@@ -260,6 +279,75 @@ fn checkLocalMacroUndef(ctx: *Context, root: ts.c.TSNode) interface.CheckError!v
                 "Function-local macro is not undefined after use",
                 "Add '#undef MACRO_NAME' immediately after the function where it is used",
             );
+        }
+    }
+}
+
+fn checkFnBodyMacroUndef(
+    ctx: *Context,
+    fn_node: ts.c.TSNode,
+    root: ts.c.TSNode,
+    after_fn_idx: u32,
+) interface.CheckError!void {
+    var cursor = ts.c.ts_tree_cursor_new(fn_node);
+    defer ts.c.ts_tree_cursor_delete(&cursor);
+
+    while (true) {
+        const node = ts.c.ts_tree_cursor_current_node(&cursor);
+        if (isMacroDef(ts.getNodeType(node))) {
+            try reportBodyMacroIfUndef(ctx, node, fn_node, root, after_fn_idx);
+        }
+        if (ts.c.ts_tree_cursor_goto_first_child(&cursor)) continue;
+        while (!ts.c.ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts.c.ts_tree_cursor_goto_parent(&cursor)) return;
+        }
+    }
+}
+
+fn reportBodyMacroIfUndef(
+    ctx: *Context,
+    node: ts.c.TSNode,
+    fn_node: ts.c.TSNode,
+    root: ts.c.TSNode,
+    after_fn_idx: u32,
+) interface.CheckError!void {
+    const name_node = ts.childByField(node, "name");
+    if (ts.isNull(name_node)) return;
+    const name = ts.getNodeText(name_node, ctx.source);
+    const def_end = ts.c.ts_node_end_byte(node);
+    if (hasUndefAfterByte(fn_node, ctx.source, name, def_end)) return;
+
+    const root_count = ts.namedChildCount(root);
+    var j = after_fn_idx;
+    while (j < root_count) : (j += 1) {
+        if (isMatchingUndef(ts.namedChild(root, j), ctx.source, name)) return;
+    }
+    try ctx.report(
+        "c/local-macro-undef",
+        ts.getNodeSpan(node),
+        "Function-local macro is not undefined after use",
+        "Add '#undef MACRO_NAME' immediately after the function where it is used",
+    );
+}
+
+fn hasUndefAfterByte(
+    scope: ts.c.TSNode,
+    source: []const u8,
+    name: []const u8,
+    min_byte: u32,
+) bool {
+    var cursor = ts.c.ts_tree_cursor_new(scope);
+    defer ts.c.ts_tree_cursor_delete(&cursor);
+    while (true) {
+        const node = ts.c.ts_tree_cursor_current_node(&cursor);
+        if (ts.c.ts_node_start_byte(node) >= min_byte and
+            isMatchingUndef(node, source, name))
+        {
+            return true;
+        }
+        if (ts.c.ts_tree_cursor_goto_first_child(&cursor)) continue;
+        while (!ts.c.ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts.c.ts_tree_cursor_goto_parent(&cursor)) return false;
         }
     }
 }
@@ -335,14 +423,6 @@ fn checkBracePlacement(ctx: *Context, node: ts.c.TSNode) interface.CheckError!vo
     const body = ts.childByField(node, "body");
     if (ts.isNull(body)) return;
 
-    const decl = ts.childByField(node, "declarator");
-    const header_end_row = if (ts.isNull(decl))
-        ts.c.ts_node_start_point(body).row
-    else
-        ts.c.ts_node_end_point(decl).row;
-
-    _ = header_end_row;
-
     try checkBlockBraces(ctx, body);
 }
 
@@ -379,6 +459,7 @@ fn checkBlockBraces(ctx: *Context, block: ts.c.TSNode) interface.CheckError!void
 
     const close = end - 1;
     if (lineStart(ctx.source, close) == lineStart(ctx.source, start)) {
+        if (ts.namedChildCount(block) == 0) return;
         try reportBadBrace(ctx, block);
         return;
     }
@@ -909,7 +990,6 @@ fn checkEintrLoop(
     ctx: *Context,
     node: ts.c.TSNode,
     fn_name: []const u8,
-    fn_node: ?ts.c.TSNode,
 ) interface.CheckError!void {
     const names = [_][]const u8{ "read", "write", "poll", "waitpid" };
     var matched = false;
@@ -918,11 +998,8 @@ fn checkEintrLoop(
     }
     if (!matched) return;
 
-    if (isInsideLoop(node)) return;
-    if (fn_node) |definition| {
-        const span = ts.getNodeSpan(definition);
-        const body = ctx.source[span.start_byte..span.end_byte];
-        if (std.mem.indexOf(u8, body, "EINTR") != null) return;
+    if (enclosingLoop(node)) |loop| {
+        if (subtreeHasIdent(loop, ctx.source, "EINTR")) return;
     }
 
     try ctx.report(
@@ -1015,7 +1092,7 @@ fn checkCalls(
     try checkSubroutineAbort(ctx, node, fn_node);
     try checkBannedFunctions(ctx, node, fn_name);
     try checkAssertSideEffects(ctx, node, fn_name);
-    try checkEintrLoop(ctx, node, fn_name, fn_node);
+    try checkEintrLoop(ctx, node, fn_name);
     try checkCloexec(ctx, node, fn_name);
     try checkMemsetScrub(ctx, node, fn_name);
 }
